@@ -1,1398 +1,1023 @@
-# Pipeline A Phase 0 YouTube System Design
+# Pipeline A Phase 0 Design
 
 ## 1. Purpose
 
-This is a clean-room system design for Pipeline A Phase 0.
+This document defines the white-box system design for Pipeline A Phase 0.
 
-It is not a concept note.
-It is not only a specification or requirements list.
-It is the design layer that explains exactly how the requirements are fulfilled by components, files, schemas, operators, inputs, outputs, gates, and report rendering.
+Phase 0 is a deterministic, **file-first**, **source-agnostic** research-compiler skeleton. It turns a bounded user topic and a bounded, user-supplied source pack into typed artifacts: source containers, selected source items, document acquisition attempts, documents, spans, evidence, minimal claims, gate results, and exported reports.
 
-The framing is:
+Objective: make each step explicit while keeping the engine independent of any specific source family:
+
+- "Take sources" becomes explicit source containers, selected source items, acquisition attempts, source adapters, document rows, normalized text, and spans.
+- "Extract evidence" becomes deterministic span selection plus evidence-card rows with schema validation.
+- "Build claims" becomes `claims` rows linked to evidence via a junction table.
+- "Write report" becomes section rows compiled only from accepted claim IDs and rendered citations, then exported to Markdown/HTML files.
+- "Quality review" becomes specific gates that read rows and write structured pass/fail rows.
+
+**Storage model.** During a run, operators read and write JSON/JSONL working files under the run directory. After rendering, `PersistRunToStore` loads the run into SQLite (`ai4research.db`) in one transaction. The same Pydantic models serialize to working files and store rows, so Section 6 is both the load target and the durable record.
+
+### 1.1 The Phase 0 Design Principle
+
+The design follows one principle:
+
+> **Phase 0 is the smallest source-agnostic skeleton that runs end-to-end on a fixture corpus and locks the contracts the later phases extend.**
+
+Two rules follow, applied to every operator, table, and gate:
+
+1. **Every element exists because it serves a Phase 0 goal** — flexibility (a source-agnostic core), readiness (a seam later phases plug into), or the ability to feed the project's preset sources today. Anything else is deferred.
+2. **Every element exists because it protects a future seam.** Phase 0 is measured by whether the data contracts (the SQLite schema) and the executor survive Phases 1–4 unchanged, not by operator count.
+
+### 1.2 Source-Agnostic Core
+
+The Phase 0 core branches only on generic rows. Domain-specific strategies, scoring, and vocabulary ("domain packs") arrive later. Every source family — YouTube, GitHub, web, policy — is a `SourceAdapter` registered against one lifecycle:
 
 ```text
-Concept:
-  Pipeline A should turn research sources into an auditable research brief.
-
-Requirement:
-  Phase 0 should use the 50 YouTube links, preserve traceability, create evidence, and render an HTML report.
-
-Design:
-  Store the 50 channel URLs as SourceSeed records, normalize them into ChannelSource records,
-  select or manually provide VideoCandidate records, load transcript fixtures into TranscriptDocument records,
-  split those documents into timestamped Span records, extract EvidenceRecord rows,
-  build lightweight Finding records, run deterministic gates, and render Markdown and HTML from those artifacts.
+source_containers -> selected_source_items -> acquisition_attempts -> documents -> spans -> evidence -> claims
 ```
 
-The main design rule:
+Each source family maps onto that lifecycle the same way:
 
-```text
-Open every black box.
-```
+| Generic entity | YouTube | GitHub | Local |
+| --- | --- | --- | --- |
+| `source_container` (a named collection, not a document) | a **channel** | a **repo** | a **folder/set** |
+| `selected_source_item` (the acquirable leaf) | a **video** | a **file / README** | a **file** |
+| `acquisition_attempt` | load transcript fixture (Phase 2: live fetch) | load file fixture (Phase 2: API read) | read local file |
+| `document` | transcript text | file text | file text |
 
-For example:
+A channel has no transcript, so the channel is the *container* and the video is the *item*. The same shape covers GitHub (repo → file). A 50-channel preset is 50 `source_containers` rows; a channel with no staged video is a container with zero selected items and appears as a coverage gap.
 
-```text
-"Use sources"
-  -> use exactly 50 YouTube channel URLs
-  -> parse channel handles
-  -> create source records
-  -> attach selected videos
-  -> attach transcript documents
-  -> create spans
-  -> create evidence
-  -> create findings
-  -> create report sections
-```
+Provider-specific data (YouTube handles/timestamps, GitHub SHAs/stars) lives only in `provider_metadata` on `selected_source_items` and `documents`. Generic columns in `selected_source_items`, `spans`, `evidence`, and `claims` contain no `youtube_*`/`github_*` fields. `ProviderFieldQuarantineGate` enforces this.
+
+The required first adapter is `local_document_file`: a plain local `.md` flowing through the full spine proves the spine is not YouTube-specific. The `youtube_transcript_fixture` adapter is then built through the same interface and is required for the Phase 0 proving run (Section 14.2); `github_file_fixture` is optional, built the same way when needed.
 
 ## 2. Phase 0 Scope And System Target
 
-Phase 0 is a working local vertical slice.
+### 2.1 In Scope
 
-The actual system is:
+- Create a run and a per-run directory (`input/`, `work/`, `exports/`) from a user topic.
+- Convert the topic into a deterministic `research_contracts` row (no LLM).
+- Emit a real, trivial one-node question graph (the seam Phase 1 fills with generated questions).
+- Write static `physical_plan_nodes`/`_edges` rows from an `operator_specs` registry, with a `runtime` value on every plan node.
+- Accept a user-provided source pack of any supported family.
+- Split source handling into container, selected item, acquisition attempt, and document, per the Section 1.2 mapping.
+- Support a real `SourceAdapter` interface: a **required** `local_document_file` adapter (proves the spine first), a `youtube_transcript_fixture` adapter built after it and required for the proving run, and an optional `github_file_fixture` adapter.
+- Record an `acquisition_attempts` row for every selected item, including fixtures and failures.
+- Normalize documents into a canonical `normalized_text`; split into stable, offset-anchored spans.
+- Build evidence rows from spans, then `claims` rows from evidence (linked via `claim_evidence`).
+- Validate referential integrity, span offsets, the provider-field quarantine, claim support, and report grounding.
+- Compile Markdown and HTML reports from accepted claims only; export them as files tracked in `artifact_exports`.
+- Record `operator_invocations`, a quality dossier, and a bundle manifest for every run (finalized, diagnostic-only, or failed), then load the whole run into the SQLite store.
+- Fail closed when evidence, claim, citation, or report references are invalid.
+- Provide contract tests asserting that later-phase operators must emit the same row shapes.
 
-```text
-topic
-  -> 50 YouTube channel seeds
-  -> normalized channel source records
-  -> selected video candidates
-  -> transcript documents
-  -> timestamped transcript spans
-  -> evidence records
-  -> lightweight findings
-  -> deterministic gates
-  -> Markdown report
-  -> self-contained HTML research brief
-  -> bundle manifest
-```
+### 2.2 Out Of Scope (deferred, with seams reserved)
 
-The core design choice is that the 50 YouTube links are channel source seeds. A channel is a source container, not evidence by itself. Evidence must come from a specific video transcript, description, or manually supplied excerpt associated with that channel.
+- Live web search, automatic YouTube downloading, live GitHub API reads, browser automation.
+- LLM-based extraction or planning.
+- Question-graph *generation* (the stub row exists; generation is Phase 1).
+- Domain-pack *selection* / classifier; rule-based or score-based optimizer.
+- Heavy document parsing (HTML boilerplate stripping, PDF extraction) — Phase 2.
+- Full claim-graph semantics: contradiction, entailment, deduplication, multi-claim-per-span — Phase 2/3.
+- Acquisition *machinery*: retries, backoff, rate-limit handling, multi-provider fallback — Phase 2.
+- Adaptive repair *execution* (repair tasks are recorded, not executed); large ontology; multi-agent / Codex runtime; long-form synthesis.
+- Multi-run analytics, dashboards, server/ORM layers (raw `sqlite3` + typed models is enough for Phase 0).
 
-Phase 0 therefore has two YouTube layers:
+### 2.3 Seams Built in Phase 0
 
-```text
-Channel layer:
-  parse, normalize, classify, and report coverage of all 50 channels
+These four seams are built in Phase 0 because retrofitting them later would force a schema change:
 
-Video/document layer:
-  register a small selected video set and load transcript fixtures for those videos
-```
+1. **`physical_plan_*` rows written by a static optimizer** + `optimizer_decisions` rows — the swap point for the Phase 1 rule optimizer and Phase 2 score optimizer.
+2. **An `operator_specs` registry + `Operator` base contract** — the Phase 1 modularity seam.
+3. **A `runtime` column on every plan node** (default `local_python`) — the Phase 4 Codex-dispatch seam.
+4. **A real one-node question graph** — the Phase 1 question-generation seam (replace the body, not insert a node).
 
-Assumption:
+### 2.4 Phase 0 Decisions
 
-```text
-5 days x 8 hours = 40 focused engineering hours
-```
-
-Recommended build target:
-
-```text
-Minimum strong demo:
-  - all 50 channels normalized and shown in source coverage
-  - 5 to 10 selected video records
-  - 3 to 5 transcript fixtures
-  - at least 20 spans
-  - at least 8 evidence records
-  - at least 4 supported findings
-  - all blocking gates pass
-  - HTML report renders source coverage, findings, evidence, and gaps
-```
-
-This is a real Phase 0, not too much, because the hard parts are bounded:
-
-- no required live YouTube scraping
-- no full source discovery
-- no full claim graph
-- no contradiction search
-- no adaptive optimizer
-
-Deferred:
-
-- automatic discovery across the entire web
-- automatic video discovery across all 50 channels
-- full optimizer
-- full ontology
-- full claim graph
-- contradiction search
-- adaptive repair DAG execution
-- multi-agent Codex runtime inside the actual pipeline
-- dashboard
-- persistent database
-
-Phase 0 still keeps the interfaces that make those later upgrades easy: typed artifacts, a physical plan artifact, operator invocation records, deterministic gates, repair tasks, and a report view model.
+- Working state during a run is file-first (JSON/JSONL under `<run_id>/work/`); after the report is rendered, `PersistRunToStore` loads the run into a **single SQLite store** (`ai4research.db`) — the durable, queryable record.
+- The initial source set is explicitly supplied; Phase 0 does not discover sources.
+- Phase 0 accepts any positive number of items. The project may supply ~50 YouTube channels and a set of GitHub repos; tests use tiny local packs. Counts are contract config, never hardcoded.
+- A YouTube item is a video URL plus a supplied transcript fixture; a GitHub item is a repo file plus a supplied file fixture. Network fetching is out of scope.
+- Channel/repo = container; video/file = item; transcript/file text = document (Section 1.2).
+- One `claims` row per evidence row by default; multiple claims per span deferred.
+- `published_at`/provider metadata may be `null`; missing → warning, not blocking.
+- Pydantic v2 models map 1:1 to both working files and store rows — one set of contracts. Working files are canonical during the run; the SQLite store is the durable record after.
+- Gates run before rendering; rendering is blocked unless the dossier approves it.
+- Missing acquisition is a failed `acquisition_attempts` row; it blocks rendering only when contract coverage thresholds are unmet.
+- A bundle manifest row set + exported `bundle_manifest.json` is written for finalized, diagnostic-only, and failed runs.
+- The source-agnostic rule is enforced by a blocking gate.
 
 ## 3. Source Corpus
 
-### 3.1 Exact Phase 0 Source Seeds
+Phase 0 treats the source corpus as a bounded, user-supplied source pack loaded into `source_containers` and `selected_source_items`. The pack may be tiny in tests or the real project set (YouTube channels, GitHub repos, or a mix). Sources enter through generic rows, not source-specific pipeline code.
 
-These 50 channel URLs are the Phase 0 source seed set.
+The Phase 0 source path is:
 
-| # | Name | Channel URL | Seed Type |
-| --- | --- | --- | --- |
-| 1 | Silicon Valley 101 | https://www.youtube.com/@valley101podcast | youtube_channel |
-| 2 | HubSpot | https://www.youtube.com/@HubSpotLive | youtube_channel |
-| 3 | Microsoft Research | https://www.youtube.com/@MicrosoftResearch | youtube_channel |
-| 4 | Open Compute Project | https://www.youtube.com/@OpencomputeOrg | youtube_channel |
-| 5 | Stanford Online | https://www.youtube.com/@stanfordonline | youtube_channel |
-| 6 | Computer History Museum | https://www.youtube.com/@ComputerHistory | youtube_channel |
-| 7 | Databricks | https://www.youtube.com/@Databricks | youtube_channel |
-| 8 | Google Cloud | https://www.youtube.com/@googlecloudtech | youtube_channel |
-| 9 | Microsoft Cloud | https://www.youtube.com/@MicrosoftAzure | youtube_channel |
-| 10 | Erlang Solutions | https://www.youtube.com/@GOTO- | youtube_channel |
-| 11 | ITU | https://www.youtube.com/@AIforGood | youtube_channel |
-| 12 | Tech Field Day Plus | https://www.youtube.com/@Techfieldday | youtube_channel |
-| 13 | ACM India | https://www.youtube.com/@TheOfficialACM | youtube_channel |
-| 14 | Bg2 Pod | https://www.youtube.com/@Bg2Pod | youtube_channel |
-| 15 | Open Data Science and AI Conference | https://www.youtube.com/@ODSCAI | youtube_channel |
-| 16 | UC Berkeley EECS | https://www.youtube.com/@BerkeleyEECS | youtube_channel |
-| 17 | USENIX | https://www.youtube.com/@UsenixOrg | youtube_channel |
-| 18 | MLOps Clips | https://www.youtube.com/@MLOps | youtube_channel |
-| 19 | London Clojurians | https://www.youtube.com/@LondonClojurians | youtube_channel |
-| 20 | Google | https://www.youtube.com/@Google | youtube_channel |
-| 21 | The Information Bottleneck | https://www.youtube.com/@information_bottleneck | youtube_channel |
-| 22 | Google DeepMind | https://www.youtube.com/@googledeepmind | youtube_channel |
-| 23 | Moonshots Clips | https://www.youtube.com/@peterdiamandis | youtube_channel |
-| 24 | AI Engineer | https://www.youtube.com/@aiDotEngineer | youtube_channel |
-| 25 | a16z Deep Dives | https://www.youtube.com/@a16z | youtube_channel |
-| 26 | Beyond the Prompt | https://www.youtube.com/@BeyondthePrompt | youtube_channel |
-| 27 | Hannah Fry | https://www.youtube.com/@fryrsquared | youtube_channel |
-| 28 | YC Root Access | https://www.youtube.com/@ycombinator | youtube_channel |
-| 29 | Silicon Valley Vector | https://www.youtube.com/@SiliconValleyVector | youtube_channel |
-| 30 | All-In Podcast | https://www.youtube.com/@allin | youtube_channel |
-| 31 | Google for Developers | https://www.youtube.com/@GoogleDevelopers | youtube_channel |
-| 32 | New York Times Events | https://www.youtube.com/@NewYorkTimesEvents | youtube_channel |
-| 33 | Welch Labs | https://www.youtube.com/@WelchLabs | youtube_channel |
-| 34 | Center for Strategic & International Studies | https://www.youtube.com/@csis | youtube_channel |
-| 35 | WhynotTV | https://www.youtube.com/@whynottv1999 | youtube_channel |
-| 36 | Prime Intellect AI | https://www.youtube.com/@PrimeIntellect | youtube_channel |
-| 37 | Sequoia Capital | https://www.youtube.com/@sequoiacapital | youtube_channel |
-| 38 | Connected DMV | https://www.youtube.com/@connecteddmv3554 | youtube_channel |
-| 39 | Anyscale | https://www.youtube.com/@anyscale | youtube_channel |
-| 40 | Funding the Commons | https://www.youtube.com/@Funding-the-Commons | youtube_channel |
-| 41 | Dwarkesh Clips | https://www.youtube.com/@DwarkeshPatel | youtube_channel |
-| 42 | No Priors | https://www.youtube.com/@NoPriorsPodcast | youtube_channel |
-| 43 | Interesting Times with Ross Douthat | https://www.youtube.com/@InterestingTimesNYT | youtube_channel |
-| 44 | PeopleReign | https://www.youtube.com/@peoplereign | youtube_channel |
-| 45 | Berkeley RDI | https://www.youtube.com/@BerkeleyRDI | youtube_channel |
-| 46 | Foresight Institute | https://www.youtube.com/@ForesightInstitute | youtube_channel |
-| 47 | S3 Science Startups and Stories | https://www.youtube.com/@sciencestartupsandstories | youtube_channel |
-| 48 | Out Of Office Podcast | https://www.youtube.com/@lightspeedvp | youtube_channel |
-| 49 | Joe Lonsdale Clips | https://www.youtube.com/@Joe_Lonsdale | youtube_channel |
-| 50 | Alex Kantrowitz | https://www.youtube.com/@Alex.kantrowitz | youtube_channel |
- 
-The storage format for these seeds is defined as the `SourceSeed` artifact in Section 7.1.
+```text
+source_containers      (channel / repo / folder)
+  -> selected_source_items   (video / file)
+  -> acquisition_attempts
+  -> documents (raw)
+  -> documents.normalized_text
+  -> spans
+  -> evidence
+```
+
+**Preset ingestion in Phase 0.** Preset links (about 50 YouTube channels and the GitHub repos) load as rows and validate as seeds. The coverage section lists every container, including channels/repos with no staged fixture. Items with a staged transcript/file fixture flow end-to-end to the report. Live acquisition is Phase 2 and uses the same `SourceAdapter` interface.
 
 ## 4. System Design Diagram
 
-This is the full Phase 0 system flow. It shows both the operator sequence and the durable artifacts each operator writes.
-
 ```mermaid
-%%{init: {"flowchart": {"htmlLabels": true, "nodeSpacing": 65, "rankSpacing": 80}} }%%
 flowchart TD
-    U1["Input<br/>topic<br/>CLI text"] --> O01
-    U2["Input<br/>50 channel seeds<br/>JSONL"] --> O01
-    U2 --> O05
-    U3["Input<br/>video candidates<br/>JSONL"] --> O07
-    U4["Input<br/>transcripts<br/>TXT/VTT/SRT/JSON"] --> O08
+  U["User input\nFormat: topic string + optional run config\nExample: latest technologies in skills governance"]
+  O0["O0 RunInitializeOperator\nIn: TopicInput\nOut: run dir (input/ work/ exports/) + operator_specs seed"]
+  O1["O1 ResearchContractOperator\nIn: topic\nOut: work/research_contract.json"]
+  O2["O2 QuestionGraphStubOperator\nIn: contract\nOut: work/question_graph.json (one node)"]
+  O3["O3 StaticPlanOperator\nIn: contract + operator_specs\nOut: work/physical_plan.json + optimizer_decisions.jsonl"]
+  O4["O4 SourceContainerLoadOperator\nIn: input/source_containers.jsonl\nOut: work/source_containers.jsonl"]
+  O5["O5 SourceItemSelectOperator\nIn: source containers\nOut: work/selected_source_items.jsonl"]
+  O6["O6 DocumentAcquisitionOperator\nTech: SourceAdapter registry\nIn: items + input/fixtures\nOut: work/acquisition_attempts.jsonl + work/documents (raw)"]
+  O7["O7 DocumentNormalizeOperator\nIn: raw documents\nOut: work/documents (normalized_text)"]
+  O8["O8 SpanSegmentOperator\nIn: normalized docs\nOut: work/spans.jsonl"]
+  O9["O9 EvidenceCardBuildOperator\nIn: spans\nOut: work/evidence.jsonl"]
+  O10["O10 ClaimLiteBuildOperator\nIn: evidence\nOut: work/claims.jsonl + claim_evidence.jsonl"]
+  O11["O11 CitationMapBuildOperator\nIn: evidence + spans + documents + items\nOut: work/citations.jsonl"]
+  O12["O12 ReportBlueprintOperator\nIn: contract + claims + citations\nOut: work/report_sections.jsonl + section_claims.jsonl"]
+  G["G PreRenderQualityGateSuite\nIn: all work/ files\nOut: work/gate_results.jsonl + quality_dossier.json + repair_tasks.jsonl"]
+  O13["O13 MarkdownReportCompileOperator\nIn: sections + citations + passing dossier\nOut: exports/final_report.md (or diagnostic_report.md)"]
+  O14["O14 HtmlRenderOperator\nIn: the compiled Markdown\nOut: exports/*.html"]
+  P["O15 PersistRunToStore\nIn: all work/ files\nOut: load run into ai4research.db (one txn; FKs = final integrity check)"]
+  F["F FinalCloseoutGate\nIn: exported report + dossier + store-load result\nOut: closeout gate_results (passes only if persist succeeded)"]
+  B["B BundleExportOperator\nIn: store + exports\nOut: exports/bundle_manifest.json (+ bundle_artifacts)"]
+  R["Final research bundle\nSQLite store + exported MD/HTML/JSON"]
 
-    O01["O01<br/>RunInitOperator<br/>Python filesystem"]
-    O02["O02<br/>ResearchContractOperator<br/>schema model"]
-    O03["O03<br/>StaticPlanOperator<br/>fixed DAG"]
-    O04["O04<br/>OperatorRunner<br/>Python orchestrator"]
-
-    O05["O05<br/>ChannelSourceNormalize<br/>parse handles"]
-    O06["O06<br/>ChannelCoverage<br/>coverage summary"]
-    O07["O07<br/>VideoCandidateRegister<br/>manual video list"]
-    O08["O08<br/>TranscriptDocumentLoad<br/>local fixtures"]
-    O09["O09<br/>TranscriptNormalize<br/>segment schema"]
-    O10["O10<br/>SpanExtract<br/>chunk splitter"]
-    O11["O11<br/>EvidenceExtract<br/>rules / optional LLM"]
-    O12["O12<br/>FindingBuild<br/>evidence-linked"]
-    O13["O13<br/>GateRunner<br/>deterministic gates"]
-    G1["Blocking Gates<br/>source count<br/>channel URLs<br/>unique sources<br/>video refs<br/>span refs<br/>evidence refs<br/>finding refs<br/>report citations"]
-    G2{"Blocking gates pass?"}
-
-    O14["O14<br/>MarkdownReportCompile<br/>report tables"]
-    O15["O15<br/>HtmlReportRender<br/>HTML / CSS"]
-    O16["O16<br/>BundleManifest<br/>artifact inventory"]
-    R1["Repair Tasks<br/>repair_tasks.jsonl"]
-
-    A01["input/<br/>topic.json<br/>youtube_channels.jsonl"]
-    A02["contract/<br/>research_contract.json"]
-    A03["plan/<br/>physical_plan.json<br/>operator_invocations.jsonl"]
-    A04["sources/<br/>channel_sources.jsonl"]
-    A05["sources/<br/>channel_coverage.json"]
-    A06["sources/<br/>video_candidates.jsonl<br/>selected_videos.jsonl"]
-    A07["documents/<br/>transcript_documents.jsonl"]
-    A08["documents/<br/>transcript_segments.jsonl"]
-    A09["spans/<br/>spans.jsonl"]
-    A10["evidence/<br/>evidence_ledger.jsonl"]
-    A11["findings/<br/>findings.jsonl<br/>finding_links.jsonl"]
-    A12["gates/<br/>gate_results.jsonl<br/>quality_dossier.json"]
-    A13["repair/<br/>repair_tasks.jsonl"]
-    A14["report/<br/>report.md<br/>report tables"]
-    A15["report/<br/>html_view_model.json<br/>report.html"]
-    A16["bundle/<br/>manifest.json"]
-
-    O01 --> O02 --> O03 --> O04
-    O04 --> O05 --> O06 --> O07 --> O08 --> O09 --> O10 --> O11 --> O12 --> O13
-    O13 --> G1 --> G2
-    G2 -- "yes" --> O14 --> O15 --> O16
-    G2 -- "no" --> R1
-
-    O01 -. writes .-> A01
-    O02 -. writes .-> A02
-    O03 -. writes .-> A03
-    O04 -. writes .-> A03
-    O05 -. writes .-> A04
-    O06 -. writes .-> A05
-    O07 -. writes .-> A06
-    O08 -. writes .-> A07
-    O09 -. writes .-> A08
-    O10 -. writes .-> A09
-    O11 -. writes .-> A10
-    O12 -. writes .-> A11
-    O13 -. writes .-> A12
-    O13 -. writes .-> A13
-    R1 -. writes .-> A13
-    O14 -. writes .-> A14
-    O15 -. writes .-> A15
-    O16 -. writes .-> A16
+  U --> O0 --> O1 --> O2 --> O3 --> O4 --> O5 --> O6 --> O7 --> O8 --> O9 --> O10 --> O11 --> O12 --> G --> O13 --> O14 --> P --> F --> B --> R
+  O3 --> G
+  O8 --> G
+  O9 --> G
+  O11 --> G
+  O12 --> G
 ```
 
-Diagram legend:
+### 4.1 Input And Output Contract By Step
 
-| Label | Meaning |
-| --- | --- |
-| `U*` | user-supplied input |
-| `O*` | executable Phase 0 operator |
-| `G*` | gate decision or gate group |
-| `R*` | repair output |
-| `A*` | durable artifact |
-| Solid arrow | execution or artifact handoff |
-| Dotted arrow | artifact written by an operator |
+During a run, operators write JSON/JSONL working files; `PersistRunToStore` loads them into SQLite at the end. Only render and bundle steps write export files.
 
-### 4.1 Evidence Trace Diagram
+| Step | Operator | Reads | Writes (work files; loaded to the store at the end) | Blocking Validation |
+| --- | --- | --- | --- | --- |
+| O0 | `RunInitializeOperator` | `TopicInput` | run dir (`input/ work/ exports/`); `operator_specs` seed | run ID unique |
+| O1 | `ResearchContractOperator` | topic | `work/research_contract.json` | topic non-empty, required dimensions present |
+| O2 | `QuestionGraphStubOperator` | contract | `work/question_graph.json` | exactly one root node |
+| O3 | `StaticPlanOperator` | contract, `operator_specs` | `work/physical_plan.json`, `optimizer_decisions.jsonl` | operators registered, DAG acyclic, every required artifact has a producer, every node has a `runtime` |
+| O4 | `SourceContainerLoadOperator` | `input/source_containers.jsonl` | `work/source_containers.jsonl` | container IDs unique, pack type supported |
+| O5 | `SourceItemSelectOperator` | source containers | `work/selected_source_items.jsonl` | item IDs unique, container ref valid, adapter registered |
+| O6 | `DocumentAcquisitionOperator` | selected items + fixtures | `work/acquisition_attempts.jsonl`, `work/documents/` (raw) | every item yields a document or a structured failed attempt |
+| O7 | `DocumentNormalizeOperator` | raw documents | `work/documents/` (normalized_text + hash) | normalized text non-empty, hash present |
+| O8 | `SpanSegmentOperator` | normalized docs | `work/spans.jsonl` | `normalized_text[start:end] == span text` |
+| O9 | `EvidenceCardBuildOperator` | spans | `work/evidence.jsonl` | references valid span/document/item; no provider fields |
+| O10 | `ClaimLiteBuildOperator` | evidence | `work/claims.jsonl`, `claim_evidence.jsonl`, `claim_edges.jsonl` | every accepted claim has ≥1 `claim_evidence` |
+| O11 | `CitationMapBuildOperator` | evidence, spans, documents, items | `work/citations.jsonl` | each citation resolves the full evidence→span→document→item path |
+| O12 | `ReportBlueprintOperator` | contract, claims, citations | `work/report_sections.jsonl`, `section_claims.jsonl`, `section_citations.jsonl` | sections reference existing claims/citations |
+| G | `PreRenderQualityGateSuite` | all work files | `work/gate_results.jsonl`, `quality_dossier.json`, `repair_tasks.jsonl` | hard-fail blocks rendering |
+| O13 | `MarkdownReportCompileOperator` | sections + claims + citations + passing dossier | export `final_report.md` (or `diagnostic_report.md`) | uses only pre-gated sections |
+| O14 | `HtmlRenderOperator` | the compiled Markdown | export `*.html` | HTML has title + citations |
+| O15 | `PersistRunToStore` | all work files | load run into `ai4research.db` (one transaction) | foreign keys resolve; load fails on any broken reference |
+| F | `FinalCloseoutGate` | exported report + dossier + store-load result | closeout `gate_results` | exports exist; only approved citations/claims; **persist succeeded** |
+| B | `BundleExportOperator` | store + exports | export `bundle_manifest.json` (+ `bundle_artifacts`) | manifest hashes exports + records final status |
 
-```mermaid
-flowchart LR
-    A["ChannelSource<br/>SRC-003"] --> B["VideoCandidate<br/>VID-003-001"]
-    B --> C["TranscriptDocument<br/>DOC-003-001"]
-    C --> D["Span<br/>SP-003-001-04"]
-    D --> E["EvidenceRecord<br/>EV-003-001"]
-    E --> F["Finding<br/>FND-001"]
-    F --> G["Report Section<br/>Key Findings"]
-```
+## 5. Run Layout
 
-### 4.2 Runtime Boundary
-
-The runtime boundary is included to clarify ownership of the run state.
-
-In Phase 0:
+The per-run directory holds user inputs, working files, and exported reports. `PersistRunToStore` loads the working files into the shared SQLite store.
 
 ```text
-Python runner:
-  owns the run directory, physical plan, operator order, schemas, gates, and rendering
-
-Manual/rule/LLM helpers:
-  may help create candidate evidence or finding text inside specific operators
-
-Gates:
-  decide whether candidate artifacts are valid enough to continue
+runs/
+  ai4research.db                       # durable SQLite store; each run is loaded here at the end
+  <run_id>/
+    input/
+      run_config.json                  # optional
+      source_containers.jsonl          # user-supplied (containers with nested items)
+      fixtures/
+        transcripts/<id>.txt           # supplied YouTube video transcript fixtures
+        documents/<id>.md              # supplied local text/markdown fixtures
+        repos/<id>.md                  # supplied GitHub file/README fixture snapshots
+    work/                              # file-first working state (one JSON/JSONL per Section 7 table)
+      research_contract.json
+      question_graph.json
+      physical_plan.json
+      operator_invocations.jsonl
+      source_containers.jsonl
+      selected_source_items.jsonl
+      acquisition_attempts.jsonl
+      documents/                       # raw + normalized text per document
+      spans.jsonl
+      evidence.jsonl
+      claims.jsonl
+      citations.jsonl
+      report_sections.jsonl
+      gate_results.jsonl
+      quality_dossier.json
+    exports/
+      final_report.md                  # finalized runs only
+      final_report.html
+      diagnostic_report.md             # blocked/failed runs, instead of final_report
+      diagnostic_report.html
+      bundle_manifest.json             # every run
 ```
 
-Why this matters:
+The store location is configurable. A shared `ai4research.db` keeps runs queryable in one place; one DB per run remains an option with the same schema.
 
-```text
-The system is not "an LLM researches and writes a report."
-The system is a Python-owned artifact pipeline where optional model assistance is bounded
-inside EvidenceExtractOperator and FindingBuildOperator.
+## 6. Data Foundation: SQLite Schema
+
+During a run, each operator writes JSON/JSONL working files; `PersistRunToStore` loads them into SQLite at the end. The schema below is the load target and durable record. It replaces per-record metadata envelopes: there is **no** `schema_name`/`schema_version`/`created_at`/`created_by_operator`/`record_hash` on every record. Instead:
+
+- **Primary keys** identify every entity (`evidence.evidence_id`, `spans.span_id`, …).
+- **Foreign keys** express references and are enforced at load (`PRAGMA foreign_keys = ON`); a broken reference fails the load. During the run, gates check working-file references. Foreign keys guarantee each reference resolves; `ReferenceIntegrityGate` checks cross-path consistency, such as `evidence.document_id` matching the document behind `evidence.span_id`. Primary keys are globally unique (run-prefixed or UUID).
+- **`run_id` foreign keys** link entity tables to `runs`.
+- **`operator_invocations` rows** capture provenance once per operator run.
+- **`artifact_exports` rows** track only files written to disk.
+- **`schema_meta`** holds the single schema version and migration log, instead of a version on every row.
+- Content hashes are limited to `documents.content_hash`, `spans.text_hash`, and `artifact_exports.sha256`.
+
+### 6.1 Foundation Tables
+
+```sql
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE schema_meta (
+  key            TEXT PRIMARY KEY,        -- e.g. 'schema_version'
+  value          TEXT NOT NULL
+);
+
+CREATE TABLE runs (
+  run_id         TEXT PRIMARY KEY,
+  topic          TEXT NOT NULL,
+  phase          TEXT NOT NULL DEFAULT 'phase0',
+  status         TEXT NOT NULL,           -- initialized | running | finalized | diagnostic_only | failed
+  started_at     TEXT NOT NULL,
+  completed_at   TEXT,
+  root_dir       TEXT NOT NULL
+);
+
+CREATE TABLE operator_specs (             -- the operator registry
+  operator_name  TEXT PRIMARY KEY,
+  version        TEXT NOT NULL,
+  input_schemas  TEXT NOT NULL,           -- JSON array
+  output_schemas TEXT NOT NULL,           -- JSON array
+  runtime        TEXT NOT NULL DEFAULT 'local_python'
+);
+
+CREATE TABLE physical_plan_nodes (        -- the static plan's steps
+  node_id        TEXT PRIMARY KEY,
+  run_id         TEXT NOT NULL REFERENCES runs(run_id),
+  operator_name  TEXT NOT NULL REFERENCES operator_specs(operator_name),
+  runtime        TEXT NOT NULL DEFAULT 'local_python',
+  order_index    INTEGER NOT NULL
+);
+
+CREATE TABLE physical_plan_edges (        -- which step feeds which
+  run_id    TEXT NOT NULL REFERENCES runs(run_id),
+  from_node TEXT NOT NULL REFERENCES physical_plan_nodes(node_id),
+  to_node   TEXT NOT NULL REFERENCES physical_plan_nodes(node_id),
+  artifact  TEXT                          -- the table dependency this edge carries
+);
+
+CREATE TABLE optimizer_decisions (        -- why the static plan looks the way it does
+  decision_id             TEXT PRIMARY KEY,
+  run_id                  TEXT NOT NULL REFERENCES runs(run_id),
+  reason                  TEXT NOT NULL,
+  alternatives_considered TEXT            -- JSON array; empty in Phase 0
+);
+
+CREATE TABLE operator_invocations (       -- provenance + trace, one row per operator run
+  invocation_id  TEXT PRIMARY KEY,
+  run_id         TEXT NOT NULL REFERENCES runs(run_id),
+  node_id        TEXT REFERENCES physical_plan_nodes(node_id),
+  operator_name  TEXT NOT NULL REFERENCES operator_specs(operator_name),
+  operator_version TEXT NOT NULL,
+  runtime        TEXT NOT NULL,
+  started_at     TEXT NOT NULL,
+  completed_at   TEXT,
+  status         TEXT NOT NULL,           -- success | failed | skipped
+  metrics        TEXT,                    -- JSON
+  error          TEXT
+);
+
+CREATE TABLE artifact_exports (           -- ONLY files written to disk
+  export_id      TEXT PRIMARY KEY,
+  run_id         TEXT NOT NULL REFERENCES runs(run_id),
+  path           TEXT NOT NULL,           -- relative to run dir
+  kind           TEXT NOT NULL,           -- markdown_report | html_report | diagnostic_report | bundle_manifest | json_export
+  sha256         TEXT NOT NULL,
+  created_by_invocation_id TEXT REFERENCES operator_invocations(invocation_id),
+  created_at     TEXT NOT NULL
+);
 ```
 
-## 5. Run Directory
+These foundation tables are the orchestration and metadata layer. What an artifact envelope used to carry is now a PK, FK, `operator_invocations` row, or `artifact_exports` row.
 
-Each run creates one directory.
+### 6.2 Convention For Entity Tables
 
-```text
-runs/<run_id>/
-  input/
-    topic.json
-    youtube_channels.jsonl
-    video_candidates.jsonl
-    transcripts/
-      <video_id>.txt
-      <video_id>.vtt
-      <video_id>.srt
-      <video_id>.json
+Entity tables use a string PK, a `run_id` FK to `runs`, and FKs for every reference. Nested or variable structures (policies, locators, provider metadata, limitations) use JSON `TEXT` where separate tables would add unnecessary Phase 0 complexity. Provider-specific data is limited to `provider_metadata` on `selected_source_items` and `documents`. Rows do **not** carry `created_by_operator`/`created_at`; provenance is recorded in `operator_invocations`. Enum-like columns (statuses, types, families) are documented as comments and enforced by the Pydantic write layer before insert; SQLite `CHECK` constraints may be added later but are not required in Phase 0.
 
-  contract/
-    research_contract.json
+## 7. Core Data Structures (Tables)
 
-  plan/
-    physical_plan.json
-    operator_invocations.jsonl
+Each subsection is a table. Column lists are the Phase 0 contract; Pydantic v2 models mirror them 1:1. The **source-agnostic invariant** applies throughout: `selected_source_items` (outside `provider_metadata`), `spans`, `evidence`, and `claims` contain no provider-specific columns. `ProviderFieldQuarantineGate` enforces this.
 
-  sources/
-    channel_sources.jsonl
-    channel_coverage_summary.json
-    video_candidates.jsonl
-    selected_videos.jsonl
+### 7.1 TopicInput (transient input, not a table)
 
-  documents/
-    transcript_documents.jsonl
-    transcript_segments.jsonl
+The CLI accepts a topic; O0 writes a `runs` row and stores the optional `input/run_config.json`. `topic` must be non-empty. Phase 0 infers no hidden constraints.
 
-  spans/
-    spans.jsonl
+### 7.2 runs
 
-  evidence/
-    evidence_ledger.jsonl
+See §6.1. The root parent of every other row.
 
-  findings/
-    findings.jsonl
-    finding_evidence_links.jsonl
+### 7.3 research_contracts
 
-  gates/
-    gate_results.jsonl
-    quality_dossier.json
-
-  repair/
-    repair_tasks.jsonl
-
-  report/
-    report.md
-    report.html
-    source_map.json
-    evidence_table.json
-    finding_traceability_table.json
-
-  bundle/
-    manifest.json
-
-  trace/
-    events.jsonl
+```sql
+CREATE TABLE research_contracts (
+  contract_id    TEXT PRIMARY KEY,
+  run_id         TEXT NOT NULL REFERENCES runs(run_id),
+  topic          TEXT NOT NULL,
+  research_type  TEXT NOT NULL,           -- 'source_pack_evidence_report'
+  audience       TEXT,
+  freshness_required INTEGER NOT NULL DEFAULT 0,
+  freshness_window_days INTEGER,
+  source_policy  TEXT NOT NULL,           -- JSON: allowed_source_pack_types, allowed_source_adapters,
+                                          --       minimum_source_count, expected_source_count (nullable), exact_source_list_required
+  required_dimensions TEXT NOT NULL,      -- JSON array
+  critical_claim_policy TEXT NOT NULL,    -- JSON: minimum_supporting_evidence, allow_unsupported_critical_claims=false
+  deliverables   TEXT NOT NULL            -- JSON array
+);
 ```
 
-## 6. Tech Stack
+`source_policy.allowed_source_pack_types = ["local_document_set","youtube_channel","github_repo"]`. `expected_source_count` is config and may be `null`; it is never a hardcoded `== 50` gate. `SourceCoverageGate` blocks when fewer than `minimum_source_count` sources are present, and warns otherwise.
 
-| Layer | Phase 0 Choice | Why |
-| --- | --- | --- |
-| Orchestration | Python 3.11+ CLI | simple, local, inspectable |
-| CLI | `argparse` first, Typer optional | avoid extra dependencies unless useful |
-| Models | Pydantic recommended, dataclasses acceptable | structured validation |
-| Artifacts | JSONL for rows, JSON for manifests | easy to inspect and append |
-| URL parsing | `urllib.parse` + regex | deterministic channel handle extraction |
-| Transcript parsing | Python readers for TXT/VTT/SRT/JSON | fixture-first, no network requirement |
-| Span extraction | Python chunking | deterministic references |
-| Evidence extraction | manual/rule-based first, optional LLM helper | keeps Phase 0 controllable |
-| Report templates | Jinja2 or stdlib templates | predictable Markdown/HTML |
-| HTML | self-contained HTML/CSS, no required JS | easy to open and share |
-| Tests | `pytest` or `unittest` | local validation |
-| Future runtime | Codex runtime adapter | later operator execution, not Phase 0 core |
+### 7.4 question_graph_nodes / question_graph_edges
 
-## 7. Core Data Structures And Artifact Schemas
+Phase 0 writes one root node equal to the topic. Phase 1 replaces the producing operator body with generated nodes/edges without changing the spine.
 
-This section defines the durable artifacts written by the system. The operator section later explains which operator creates each artifact.
-
-### 7.1 SourceSeed
-
-Path:
-
-```text
-input/youtube_channels.jsonl
+```sql
+CREATE TABLE question_graph_nodes (
+  node_id TEXT PRIMARY KEY,
+  run_id  TEXT NOT NULL REFERENCES runs(run_id),
+  type    TEXT NOT NULL,                  -- 'root_question' in Phase 0
+  text    TEXT NOT NULL,
+  status  TEXT NOT NULL DEFAULT 'open'
+);
+CREATE TABLE question_graph_edges (
+  run_id  TEXT NOT NULL REFERENCES runs(run_id),
+  from_node TEXT NOT NULL REFERENCES question_graph_nodes(node_id),
+  to_node   TEXT NOT NULL REFERENCES question_graph_nodes(node_id),
+  type    TEXT NOT NULL
+);
 ```
 
-Schema:
+### 7.5 source_containers
+
+A named collection that yields candidate items but is not itself a document: a YouTube **channel**, GitHub **repo**, or local **folder/set**.
+
+```sql
+CREATE TABLE source_containers (
+  container_id     TEXT PRIMARY KEY,
+  run_id           TEXT NOT NULL REFERENCES runs(run_id),
+  source_pack_type TEXT NOT NULL,         -- 'local_document_set' | 'youtube_channel' | 'github_repo'
+  container_locator TEXT,                 -- channel URL / repo URL / folder path
+  label            TEXT,
+  container_rank   INTEGER,               -- preserves user order
+  user_supplied    INTEGER NOT NULL DEFAULT 1
+);
+```
+
+Supported Phase 0 container types and their items:
+
+| source_pack_type | Container is | Item is | Required item locator | Default adapter |
+| --- | --- | --- | --- | --- |
+| `local_document_set` | a folder/set | a file | `local_path` or `inline_text` | `local_document_file` |
+| `youtube_channel` | a channel | a video | `url` + (`local_fixture_path` or `inline_text`) | `youtube_transcript_fixture` |
+| `github_repo` | a repo | a file/README | `url` + `local_fixture_path` | `github_file_fixture` |
+
+A 50-channel preset = 50 `source_containers` rows of type `youtube_channel`. A channel with no selected videos = a container with zero `selected_source_items` = a coverage gap.
+
+**Input shape.** `input/source_containers.jsonl` contains one container per line, each with a nested `items` array. `O4 SourceContainerLoadOperator` writes `source_containers`; `O5 SourceItemSelectOperator` expands items into `selected_source_items` (Phase 0 selects all). An empty `items` array is a valid coverage gap.
 
 ```json
 {
-  "seed_id": "YS-003",
-  "name": "Microsoft Research",
-  "url": "https://www.youtube.com/@MicrosoftResearch",
-  "source_family": "youtube_channel",
-  "category": "AI / Tech",
-  "supplied_by": "user",
-  "notes": ""
-}
-```
-
-Why JSONL:
-
-- each channel can carry a display name
-- category can be stored up front
-- malformed records can be reported by line number
-- future source families can share the same seed format
-
-### 7.2 ResearchContract
-
-Path:
-
-```text
-contract/research_contract.json
-```
-
-Schema:
-
-```json
-{
-  "contract_id": "RC-20260528-001",
-  "topic": "latest technologies in skills governance",
-  "research_question": "What signals about the topic are visible in the selected YouTube source set?",
-  "audience": "technical_executive",
-  "run_mode": "phase0_youtube_vertical_slice",
-  "source_policy": {
-    "source_seed_file": "input/youtube_channels.jsonl",
-    "source_family": "youtube_channel",
-    "expected_channel_count": 50,
-    "allow_manual_video_candidates": true,
-    "allow_local_transcript_fixtures": true,
-    "require_live_retrieval": false
-  },
-  "evidence_policy": {
-    "min_transcript_documents": 3,
-    "min_evidence_records": 8,
-    "strong_finding_min_evidence": 2,
-    "moderate_finding_min_evidence": 1
-  },
-  "report_policy": {
-    "formats": ["markdown", "html"],
-    "include_all_50_channels": true,
-    "include_gaps": true,
-    "include_traceability": true
-  }
-}
-```
-
-### 7.3 PhysicalPlan
-
-Path:
-
-```text
-plan/physical_plan.json
-```
-
-Schema:
-
-```json
-{
-  "plan_id": "PLAN-P0-YT-001",
-  "plan_type": "static",
-  "nodes": [
+  "container_id": "C-YT-001",
+  "source_pack_type": "youtube_channel",
+  "container_locator": "https://www.youtube.com/@example",
+  "label": "Example channel",
+  "items": [
     {
-      "node_id": "N01",
-      "operator": "RunInitOperator",
-      "runtime": "local_python",
-      "inputs": ["cli.topic", "cli.youtube_seed_file"],
-      "outputs": ["input/topic.json", "input/youtube_channels.jsonl"]
+      "item_id": "I-YT-001-01",
+      "item_locator": { "url": "https://www.youtube.com/watch?v=abc123", "local_fixture_path": "input/fixtures/transcripts/abc123.txt" },
+      "title": "Example talk",
+      "provider_metadata": { "video_id": "abc123" }
     }
-  ],
-  "edges": [
-    {"from": "N01", "to": "N02"}
-  ],
-  "stop_conditions": [
-    "blocking_gate_failed",
-    "report_rendered",
-    "operator_exception"
-  ],
-  "budget": {
-    "network_required": false,
-    "llm_required": false,
-    "max_runtime_minutes": 20
-  }
+  ]
 }
 ```
 
-### 7.4 OperatorInvocation
+### 7.6 selected_source_items
 
-Path:
+The acquirable leaf selected from a container: a video, repo file, or local file. Phase 0 selects all supplied items; later phases can rank, filter, dedupe, or budget at this boundary.
 
-```text
-plan/operator_invocations.jsonl
+```sql
+CREATE TABLE selected_source_items (
+  selected_item_id   TEXT PRIMARY KEY,
+  run_id             TEXT NOT NULL REFERENCES runs(run_id),
+  container_id       TEXT NOT NULL REFERENCES source_containers(container_id),
+  source_family      TEXT NOT NULL,       -- generic routing key: 'local_document'|'youtube_video'|'github_file'
+  adapter_id         TEXT NOT NULL,
+  item_locator       TEXT NOT NULL,       -- JSON: url / local_path / local_fixture_path / inline_text
+  title              TEXT,
+  creator            TEXT,
+  published_at       TEXT,
+  accessed_at        TEXT,
+  source_rank        INTEGER,
+  selection_reason   TEXT,                -- 'Phase 0 include_all policy'
+  acquisition_status TEXT NOT NULL DEFAULT 'pending',
+  provider_metadata  TEXT                 -- JSON: youtube_handle, video_id, github_path, sha, ... (engine never reads)
+);
 ```
 
-Schema:
+`source_family` is an open routing value for adapter selection; the engine does not special-case individual values. Generic operators must not depend on `provider_metadata`; adapters (for acquisition) and render helpers (for deep links) may read it.
 
-```json
-{
-  "invocation_id": "OPINV-001",
-  "node_id": "N04",
-  "operator": "ChannelSourceNormalizeOperator",
-  "operator_version": "p0.1",
-  "runtime": "local_python",
-  "input_artifacts": ["input/youtube_channels.jsonl"],
-  "output_artifacts": ["sources/channel_sources.jsonl"],
-  "status": "success",
-  "started_at": "2026-05-28T09:00:00-04:00",
-  "finished_at": "2026-05-28T09:00:01-04:00",
-  "metrics": {
-    "input_rows": 50,
-    "output_rows": 50,
-    "invalid_urls": 0,
-    "duplicates": 0
-  }
-}
+### 7.7 acquisition_attempts
+
+The attempt to turn one selected item into a document. **Every selected item gets at least one attempt row, even on failure.** This records why an item produced no document and preserves the `item -> attempt -> document` shape Phase 2 retrieval reuses. Retries, backoff, rate limits, and multi-provider fallback are Phase 2.
+
+```sql
+CREATE TABLE acquisition_attempts (
+  attempt_id       TEXT PRIMARY KEY,
+  run_id           TEXT NOT NULL REFERENCES runs(run_id),
+  selected_item_id TEXT NOT NULL REFERENCES selected_source_items(selected_item_id),
+  adapter_id       TEXT NOT NULL,
+  attempt_number   INTEGER NOT NULL DEFAULT 1,
+  started_at       TEXT NOT NULL,
+  completed_at     TEXT,
+  status           TEXT NOT NULL,         -- succeeded | failed | skipped
+  input_locator    TEXT,                  -- JSON
+  failure_code     TEXT,                  -- e.g. 'local_fixture_missing'
+  failure_message  TEXT,
+  retryable        INTEGER NOT NULL DEFAULT 0
+);
 ```
 
-### 7.5 ChannelSource
+The common Phase 0 gap (a seed whose fixture is absent) is a row with `status='failed'`, `failure_code='local_fixture_missing'`.
 
-Path:
+### 7.8 documents
 
-```text
-sources/channel_sources.jsonl
+```sql
+CREATE TABLE documents (
+  document_id          TEXT PRIMARY KEY,
+  run_id               TEXT NOT NULL REFERENCES runs(run_id),
+  selected_item_id     TEXT NOT NULL REFERENCES selected_source_items(selected_item_id),
+  acquisition_attempt_id TEXT NOT NULL REFERENCES acquisition_attempts(attempt_id),
+  document_kind        TEXT NOT NULL,     -- 'youtube_transcript' | 'github_document' | 'local_document'
+  title                TEXT,
+  raw_text             TEXT NOT NULL,
+  normalized_text      TEXT,              -- set by O7; spans index THIS, never raw_text
+  language             TEXT,
+  published_at         TEXT,
+  content_hash         TEXT NOT NULL,
+  normalization        TEXT,              -- JSON: rules_applied, removed_content
+  provider_metadata    TEXT               -- JSON: video_id, repo sha, ...
+);
 ```
 
-Schema:
+Raw text is preserved. **`normalized_text` is the canonical text; all span offsets are defined against it.**
 
-```json
-{
-  "source_id": "SRC-YT-003",
-  "seed_id": "YS-003",
-  "source_family": "youtube_channel",
-  "name": "Microsoft Research",
-  "canonical_url": "https://www.youtube.com/@MicrosoftResearch",
-  "youtube_handle": "@MicrosoftResearch",
-  "category": "AI / Tech",
-  "authority_type": "research_lab",
-  "source_role": "primary_channel",
-  "language_hint": "unknown",
-  "status": "registered",
-  "status_reason": "",
-  "tags": ["ai", "research", "technology"],
-  "metadata": {
-    "subscriber_count": null,
-    "description": null,
-    "country": null
-  }
-}
+### 7.9 spans
+
+```sql
+CREATE TABLE spans (
+  span_id            TEXT PRIMARY KEY,
+  run_id             TEXT NOT NULL REFERENCES runs(run_id),
+  document_id        TEXT NOT NULL REFERENCES documents(document_id),
+  selected_item_id   TEXT NOT NULL REFERENCES selected_source_items(selected_item_id),
+  span_index         INTEGER NOT NULL,
+  start_char         INTEGER NOT NULL,
+  end_char           INTEGER NOT NULL,
+  text               TEXT NOT NULL,
+  segmentation_strategy TEXT NOT NULL,
+  text_hash          TEXT NOT NULL
+);
 ```
 
-Phase 0 `authority_type` values:
+Paragraph-first chunking; paragraphs over ~900 chars split into ~700–900-char sentence-aware windows; offsets into `normalized_text`; no empty spans. No `youtube_timestamp_url` column — a deep-link, if needed later, is derived at render time from the document's `provider_metadata`.
 
-```text
-research_lab
-university
-company
-conference
-media
-podcast
-think_tank
-investor
-individual
-unknown
+### 7.10 evidence
+
+```sql
+CREATE TABLE evidence (
+  evidence_id      TEXT PRIMARY KEY,
+  run_id           TEXT NOT NULL REFERENCES runs(run_id),
+  selected_item_id TEXT NOT NULL REFERENCES selected_source_items(selected_item_id),
+  document_id      TEXT NOT NULL REFERENCES documents(document_id),
+  span_id          TEXT NOT NULL REFERENCES spans(span_id),
+  evidence_type    TEXT NOT NULL,         -- definition|source_statement|example|risk|recommendation|limitation|unknown
+  summary          TEXT NOT NULL,
+  quoted_text      TEXT NOT NULL,         -- contained within the span text
+  support_strength TEXT,
+  limitations      TEXT,                  -- JSON array
+  published_at     TEXT
+);
 ```
 
-### 7.6 VideoCandidate
+### 7.11 claims (ClaimLite)
 
-Path:
+The minimal Phase 0 claim, not the full claim-graph node. Evidence links use the `claim_evidence` junction table, so support is a relational FK.
 
-```text
-sources/video_candidates.jsonl
+```sql
+CREATE TABLE claims (
+  claim_id     TEXT PRIMARY KEY,
+  run_id       TEXT NOT NULL REFERENCES runs(run_id),
+  claim_type   TEXT NOT NULL,             -- definition|technical_fact|risk_claim|recommendation_claim
+  claim_text   TEXT NOT NULL,
+  claim_scope  TEXT NOT NULL,             -- 'within provided source set'
+  criticality  TEXT NOT NULL DEFAULT 'normal',  -- normal | critical
+  status       TEXT NOT NULL,             -- draft | accepted | qualified | rejected
+  confidence   TEXT,
+  limitations  TEXT                       -- JSON array
+);
+CREATE TABLE claim_evidence (
+  claim_id     TEXT NOT NULL REFERENCES claims(claim_id),
+  evidence_id  TEXT NOT NULL REFERENCES evidence(evidence_id),
+  role         TEXT NOT NULL,             -- supporting | contradicting | qualifying
+  PRIMARY KEY (claim_id, evidence_id, role)
+);
 ```
 
-Schema:
+Rules: `accepted` requires ≥1 `supporting` row in `claim_evidence`; `critical` requires ≥ `minimum_supporting_evidence`; `claim_text` atomic enough for one span; a claim must not introduce facts absent from its evidence.
 
-```json
-{
-  "video_id": "VID-003-001",
-  "source_id": "SRC-YT-003",
-  "channel_handle": "@MicrosoftResearch",
-  "youtube_video_id": "abc123",
-  "video_url": "https://www.youtube.com/watch?v=abc123",
-  "title": "Example video title",
-  "published_at": "2026-05-01",
-  "duration_seconds": 1800,
-  "candidate_origin": "manual_fixture",
-  "selection_status": "selected",
-  "selection_reason": "topic_relevant_and_transcript_available",
-  "transcript_expected": true
-}
+### 7.12 claim_edges (claim graph stub)
+
+A minimal graph projection of claims and evidence. Full semantics — contradiction, entailment, deduplication, multi-claim-per-span, confidence propagation — are Phase 2/3.
+
+```sql
+CREATE TABLE claim_edges (
+  run_id  TEXT NOT NULL REFERENCES runs(run_id),
+  from_id TEXT NOT NULL,                  -- claim_id or evidence_id
+  to_id   TEXT NOT NULL,
+  type    TEXT NOT NULL                   -- supports | qualifies | refutes | cited_by | belongs_to_section
+);
 ```
 
-Phase 0 does not need automatic video discovery. It can use a manually supplied `input/video_candidates.jsonl`.
+### 7.13 citations
 
-### 7.7 TranscriptDocument
-
-Path:
-
-```text
-documents/transcript_documents.jsonl
+```sql
+CREATE TABLE citations (
+  citation_id      TEXT PRIMARY KEY,
+  run_id           TEXT NOT NULL REFERENCES runs(run_id),
+  evidence_id      TEXT NOT NULL REFERENCES evidence(evidence_id),
+  span_id          TEXT NOT NULL REFERENCES spans(span_id),
+  document_id      TEXT NOT NULL REFERENCES documents(document_id),
+  selected_item_id TEXT NOT NULL REFERENCES selected_source_items(selected_item_id),
+  label            TEXT NOT NULL,
+  url              TEXT,
+  accessed_at      TEXT
+);
 ```
 
-Schema:
+One citation per evidence used by an accepted claim; a citation row is rejected unless the full evidence→span→document→item path resolves.
 
-```json
-{
-  "document_id": "DOC-003-001",
-  "document_type": "youtube_transcript",
-  "source_id": "SRC-YT-003",
-  "video_id": "VID-003-001",
-  "title": "Example video title",
-  "url": "https://www.youtube.com/watch?v=abc123",
-  "published_at": "2026-05-01",
-  "retrieved_at": "2026-05-28T09:00:00-04:00",
-  "transcript_format": "txt",
-  "raw_transcript_path": "input/transcripts/abc123.txt",
-  "normalized_segments_path": "documents/transcript_segments.jsonl",
-  "char_count": 12000,
-  "status": "loaded",
-  "limitations": ["local transcript fixture"]
-}
+### 7.14 report_sections / section_claims / section_citations
+
+```sql
+CREATE TABLE report_sections (
+  section_id TEXT PRIMARY KEY,
+  run_id     TEXT NOT NULL REFERENCES runs(run_id),
+  heading    TEXT NOT NULL,
+  purpose    TEXT,
+  order_index INTEGER NOT NULL,
+  section_status TEXT NOT NULL DEFAULT 'ready'
+);
+CREATE TABLE section_claims (
+  section_id TEXT NOT NULL REFERENCES report_sections(section_id),
+  claim_id   TEXT NOT NULL REFERENCES claims(claim_id),
+  PRIMARY KEY (section_id, claim_id)
+);
+CREATE TABLE section_citations (
+  section_id  TEXT NOT NULL REFERENCES report_sections(section_id),
+  citation_id TEXT NOT NULL REFERENCES citations(citation_id),
+  PRIMARY KEY (section_id, citation_id)
+);
 ```
 
-### 7.8 TranscriptSegment
+The fixed Phase 0 sections are listed in Section 13.1.
 
-Path:
+### 7.15 gate_results
 
-```text
-documents/transcript_segments.jsonl
+```sql
+CREATE TABLE gate_results (
+  gate_result_id TEXT PRIMARY KEY,
+  run_id         TEXT NOT NULL REFERENCES runs(run_id),
+  gate_id        TEXT NOT NULL,
+  gate_version   TEXT NOT NULL,
+  status         TEXT NOT NULL,           -- pass | warning | repairable_fail | hard_fail
+  severity       TEXT NOT NULL,           -- blocking | warning
+  checked_tables TEXT,                    -- JSON array
+  issues         TEXT,                    -- JSON array
+  metrics        TEXT,                    -- JSON
+  created_at     TEXT NOT NULL
+);
 ```
 
-Schema:
+### 7.16 quality_dossier
 
-```json
-{
-  "segment_id": "SEG-003-001-0001",
-  "document_id": "DOC-003-001",
-  "source_id": "SRC-YT-003",
-  "video_id": "VID-003-001",
-  "start_seconds": 120.0,
-  "end_seconds": 136.5,
-  "text": "The transcript text for this segment.",
-  "segment_index": 1
-}
+```sql
+CREATE TABLE quality_dossier (
+  run_id                       TEXT PRIMARY KEY REFERENCES runs(run_id),
+  overall_status               TEXT NOT NULL,   -- pass | warning | fail
+  blocking_gate_failures       INTEGER NOT NULL,
+  warning_count                INTEGER NOT NULL,
+  approved_for_report_rendering INTEGER NOT NULL
+);
 ```
 
-For `.txt` transcripts without timestamps:
+### 7.17 repair_tasks
 
-```json
-{
-  "start_seconds": null,
-  "end_seconds": null
-}
+Written, not executed, in Phase 0.
+
+```sql
+CREATE TABLE repair_tasks (
+  task_id     TEXT PRIMARY KEY,
+  run_id      TEXT NOT NULL REFERENCES runs(run_id),
+  gate_id     TEXT,
+  description TEXT NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'planned_not_executed'
+);
 ```
 
-### 7.9 Span
+### 7.18 bundle_artifacts (+ exported manifest)
 
-Path:
-
-```text
-spans/spans.jsonl
+```sql
+CREATE TABLE bundle_artifacts (
+  bundle_artifact_id TEXT PRIMARY KEY,
+  run_id             TEXT NOT NULL REFERENCES runs(run_id),
+  kind               TEXT NOT NULL,       -- 'table' | 'export'
+  ref                TEXT NOT NULL,       -- table name or export path
+  sha256             TEXT,                -- for exports and table content snapshots
+  bundle_status      TEXT NOT NULL        -- finalized | diagnostic_only | failed
+);
 ```
 
-Schema:
-
-```json
-{
-  "span_id": "SP-003-001-004",
-  "document_id": "DOC-003-001",
-  "source_id": "SRC-YT-003",
-  "video_id": "VID-003-001",
-  "start_seconds": 120.0,
-  "end_seconds": 220.0,
-  "start_char": 1420,
-  "end_char": 2350,
-  "text": "A chunk of transcript text that can be cited and inspected.",
-  "span_kind": "transcript_chunk",
-  "youtube_timestamp_url": "https://www.youtube.com/watch?v=abc123&t=120s",
-  "token_estimate": 210
-}
-```
-
-Span rule:
-
-```text
-Prefer 300 to 900 characters.
-Preserve timestamp boundaries when available.
-Do not merge across videos.
-```
-
-### 7.10 EvidenceRecord
-
-Path:
-
-```text
-evidence/evidence_ledger.jsonl
-```
-
-Schema:
-
-```json
-{
-  "evidence_id": "EV-003-001",
-  "source_id": "SRC-YT-003",
-  "video_id": "VID-003-001",
-  "document_id": "DOC-003-001",
-  "span_id": "SP-003-001-004",
-  "evidence_type": "expert_statement",
-  "summary": "The speaker argues that organizations need governance around skill inference models.",
-  "quote": "Short direct excerpt if needed.",
-  "relevance": "high",
-  "source_quality": "medium",
-  "limitations": ["single video source", "requires corroboration"],
-  "created_by": "EvidenceExtractOperator",
-  "supports_finding_ids": []
-}
-```
-
-Evidence types:
-
-```text
-expert_statement
-product_signal
-technology_trend
-implementation_pattern
-market_signal
-policy_signal
-risk_signal
-definition
-caveat
-open_question
-```
-
-### 7.11 Finding
-
-Path:
-
-```text
-findings/findings.jsonl
-```
-
-Schema:
-
-```json
-{
-  "finding_id": "FND-001",
-  "finding_type": "trend",
-  "text": "Skills governance discussions increasingly connect AI inference, data quality, and organizational accountability.",
-  "strength": "moderate",
-  "confidence": 0.62,
-  "evidence_ids": ["EV-003-001", "EV-022-004"],
-  "source_ids": ["SRC-YT-003", "SRC-YT-022"],
-  "status": "accepted",
-  "limitations": ["YouTube-only Phase 0 source set"],
-  "report_section": "Key Findings"
-}
-```
-
-Finding types:
-
-```text
-trend
-comparison
-implementation_pattern
-risk
-opportunity
-recommendation
-open_question
-```
-
-This is not the full claim graph. It is a flat, evidence-linked claim table that can later be upgraded into a claim graph.
-
-### 7.12 GateResult
-
-Path:
-
-```text
-gates/gate_results.jsonl
-```
-
-Schema:
-
-```json
-{
-  "gate_id": "GATE-006",
-  "gate_name": "FindingEvidenceGate",
-  "status": "pass",
-  "severity": "blocking",
-  "checked_artifacts": [
-    "findings/findings.jsonl",
-    "evidence/evidence_ledger.jsonl"
-  ],
-  "issues": [],
-  "repairable": true,
-  "repair_suggestions": []
-}
-```
-
-### 7.13 HtmlReportViewModel
-
-Path:
-
-```text
-report/html_view_model.json
-```
-
-Schema:
-
-```json
-{
-  "title": "Pipeline A YouTube Research Brief",
-  "topic": "latest technologies in skills governance",
-  "run_id": "run-20260528-001",
-  "metrics": {
-    "channel_count": 50,
-    "selected_video_count": 8,
-    "transcript_document_count": 5,
-    "span_count": 42,
-    "evidence_count": 12,
-    "finding_count": 5,
-    "blocking_gate_failures": 0
-  },
-  "sections": {
-    "source_coverage": [],
-    "key_findings": [],
-    "evidence_table": [],
-    "gaps": [],
-    "traceability": []
-  }
-}
-```
+`BundleExportOperator` writes these rows plus `exports/bundle_manifest.json` (recorded in `artifact_exports`) for finalized, diagnostic-only, and failed runs. The retained `work/` JSON/JSONL files are the inspectable per-table snapshots; the manifest lists them alongside the store and the exported reports.
 
 ## 8. Operators And Gates
 
-This section avoids repeating the same operator information in multiple forms. The table below is the operator contract: purpose, inputs, outputs, implementation, and validation behavior in one place.
+### 8.1 Operator Contract
 
-| ID | Operator | Purpose | Consumes | Emits | Tech Stack | Key Logic | Validation / Failure Behavior |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| O01 | `RunInitOperator` | Create the run directory and copy user inputs. | CLI topic, `inputs/youtube_channels.jsonl`, optional `video_candidates.jsonl`, optional transcripts folder | `input/topic.json`, `input/youtube_channels.jsonl`, copied optional inputs, `trace/events.jsonl` | Python `pathlib`, `datetime`, UUID or slug | Create `run_id`, create folder tree, copy inputs into the run. | Fail on empty topic, missing seed file, unreadable input, or run directory collision. |
-| O02 | `ResearchContractOperator` | Turn user intent into explicit run policy. | `input/topic.json`, `input/youtube_channels.jsonl` | `contract/research_contract.json` | Pydantic or dataclasses | Set source family, expected channel count, evidence thresholds, output formats. | Fail if source family is not `youtube_channel` or required policy fields are missing. |
-| O03 | `StaticPhysicalPlanOperator` | Create the exact Phase 0 operator plan. | `contract/research_contract.json` | `plan/physical_plan.json` | Python static plan table | Write ordered nodes, edges, artifact paths, runtime choices, stop conditions. | Fail if unknown operator, missing node reference, or cyclic plan. |
-| O04 | `OperatorRunner` | Execute the plan and record operator invocations. | `plan/physical_plan.json` and referenced artifacts | `plan/operator_invocations.jsonl`, `trace/events.jsonl` | Local Python orchestrator | Run nodes in DAG order, pass artifact paths, record metrics/status. | Stop on operator exception or blocking gate; preserve partial run state. |
-| O05 | `ChannelSourceNormalizeOperator` | Parse and normalize the 50 YouTube channel URLs. | `input/youtube_channels.jsonl` | `sources/channel_sources.jsonl` | `urllib.parse`, regex, schema validation | Extract `@handle`, canonicalize URL, assign `SRC-YT-###`, classify initial authority type. | Block on malformed URL, duplicate canonical URL, duplicate handle, or non-50 official seed set. |
-| O06 | `ChannelCoverageOperator` | Summarize channel corpus coverage. | `sources/channel_sources.jsonl` | `sources/channel_coverage_summary.json` | Python counters | Count channels by category, authority type, status, selected videos, transcript coverage. | Warn if many unknown categories; block if channel count conflicts with contract. |
-| O07 | `VideoCandidateRegisterOperator` | Attach selected videos to known channels. | `sources/channel_sources.jsonl`, `input/video_candidates.jsonl` | `sources/video_candidates.jsonl`, `sources/selected_videos.jsonl` | JSONL validators, YouTube video URL parser | Validate source references, parse `youtube_video_id`, canonicalize video URL, mark selected rows. | Block if selected video references unknown channel or invalid video URL; warn if selected count below demo target. |
-| O08 | `TranscriptDocumentLoadOperator` | Load transcript fixtures for selected videos. | `sources/selected_videos.jsonl`, `input/transcripts/*` | `documents/transcript_documents.jsonl`, raw transcript records | TXT/VTT/SRT/JSON parsers | Match transcript files by video ID, load raw text/captions, preserve origin path and format. | Block malformed loaded transcript; warn on missing transcript; never fabricate text. |
-| O09 | `TranscriptNormalizeOperator` | Convert transcript formats into one segment schema. | raw transcript records, `documents/transcript_documents.jsonl` | `documents/transcript_segments.jsonl` | Text cleanup, timestamp normalization | Split TXT into paragraph segments; parse VTT/SRT timestamps; validate JSON segment lists. | Block empty loaded document, invalid timestamp order, or unknown document reference. |
-| O10 | `SpanExtractOperator` | Create citeable spans from transcript segments. | `documents/transcript_segments.jsonl` | `spans/spans.jsonl` | Deterministic Python chunking | Group adjacent segments, target 300-900 characters, preserve timestamps, create YouTube timestamp URL when possible. | Block spans that cross documents/videos or reference missing documents. |
-| O11 | `EvidenceExtractOperator` | Convert relevant spans into evidence records. | `spans/spans.jsonl`, `contract/research_contract.json` | `evidence/evidence_ledger.jsonl` | Manual records, rules, or optional LLM with schema validation | Select relevant spans, write evidence summary, quote, type, relevance, source quality, limitations. | Block evidence without valid `span_id`; reject invalid enums or unsupported whole-video evidence. |
-| O12 | `FindingBuildOperator` | Build lightweight findings from evidence. | `evidence/evidence_ledger.jsonl`, `sources/channel_sources.jsonl` | `findings/findings.jsonl`, `findings/finding_evidence_links.jsonl` | Manual/rules/optional LLM with validation | Group evidence by theme, draft finding text, assign strength/confidence, link evidence IDs. | Block accepted findings without evidence; mark weak findings as tentative or blocked. |
-| O13 | `GateRunnerOperator` | Validate artifacts before report finalization. | All core artifacts | `gates/gate_results.jsonl`, `gates/quality_dossier.json`, `repair/repair_tasks.jsonl` | Deterministic Python validators | Run source, URL, video, transcript, span, evidence, finding, citation, and report-readiness gates. | Blocking gates stop before report compilation; warning gates continue but appear in report. |
-| O14 | `MarkdownReportCompileOperator` | Compile accepted findings into Markdown and report tables. | contract, channel coverage, findings, evidence, gate results | `report/report.md`, `report/source_map.json`, `report/evidence_table.json`, `report/finding_traceability_table.json` | Jinja2 or stdlib templates | Populate deterministic report sections only from accepted findings and valid evidence. | Fail if citation references missing evidence/span or required report section is missing. |
-| O15 | `HtmlReportRenderOperator` | Render the final reviewer-facing HTML brief. | `report/report.md`, report table JSON, `report/html_view_model.json` | `report/report.html` | Self-contained HTML/CSS template | Render source coverage, findings, evidence, gaps, traceability, source appendix. | Fail if HTML hides gate failures, omits traceability, or requires external assets. |
-| O16 | `BundleManifestOperator` | Write final run inventory and status. | All required artifacts | `bundle/manifest.json` | Python filesystem inventory | List artifacts, schema version, gate status, report path, metrics, known limitations. | Fail if required artifact is missing or manifest points outside run directory. |
+Every operator implements the same contract; its spec lives in `operator_specs`. The `runtime` field is the Phase 4 seam: Phase 0 uses `local_python`; later phases can dispatch selected nodes to Codex without changing the plan.
 
-### 8.1 Gates
+```json
+{
+  "operator_name": "SpanSegmentOperator",
+  "operator_version": "0.1.0",
+  "input_schemas": ["documents"],
+  "output_schemas": ["spans"],
+  "runtime": "local_python",
+  "idempotency_key_fields": ["run_id", "document_id", "content_hash", "operator_version"],
+  "failure_modes": ["missing_document", "empty_text", "offset_mismatch"],
+  "retry_policy": { "max_attempts": 1, "retryable_failures": [] }
+}
+```
 
-Gates are part of the system diagram through `GateRunnerOperator`. They are called out separately here because they decide whether the report is allowed to finalize.
+`StaticPlanOperator` validates the physical plan against `operator_specs`. Phase 1 can register new operators and let a rule optimizer select among them without changing the executor.
 
-Blocking gates:
+### 8.2 SourceAdapter Interface
 
-| Gate | Checks | Failure Behavior |
+`SourceAdapter` turns one `selected_source_items` row into one `acquisition_attempts` row and, on success, one or more `documents` rows.
+
+```python
+class SourceAdapter(Protocol):
+    adapter_id: str
+    adapter_version: str
+    supported_source_pack_types: list[str]
+    output_document_kinds: list[str]
+
+    def validate_item(self, item: SelectedSourceItem) -> ValidationResult: ...
+    def normalize_locator(self, item: SelectedSourceItem) -> dict: ...
+    def acquire(self, item: SelectedSourceItem, run_context: RunContext) -> AcquisitionAttempt: ...
+    def materialize_documents(self, attempt: AcquisitionAttempt, run_context: RunContext) -> list[Document]: ...
+```
+
+Rules:
+- `validate_item` checks shape only.
+- `normalize_locator` canonicalizes paths, URLs, and inline payloads.
+- `acquire` performs the local read / inline capture and **always** writes an `acquisition_attempts` row.
+- `materialize_documents` writes `documents` rows only on success and puts provider-specific data only in `provider_metadata`.
+- Adapters never write outside the run directory and never discover new items in Phase 0.
+
+Phase 0 adapters (operate at the **item** level):
+
+| Adapter ID | Container type | Item | Required item locator | Output document_kind | Phase 0 status |
+| --- | --- | --- | --- | --- | --- |
+| `local_document_file` | `local_document_set` | a file | `local_path` or `inline_text` | `local_document` | **Required** — proves the spine on a non-domain source |
+| `youtube_transcript_fixture` | `youtube_channel` | a video | `url` + (`local_fixture_path` or `inline_text`) | `youtube_transcript` | built after the spine; required for the proving run (14.2) |
+| `github_file_fixture` | `github_repo` | a file/README | `url` + `local_fixture_path` | `github_document` | optional; built after the spine when needed |
+
+Phase 2 note: GitHub evidence is partly structured (stars, release cadence), not only document text. Phase 0 models GitHub as file/README text; spans over structured metrics are a Phase 2 schema extension.
+
+### 8.3 Operator Designs
+
+All Phase 0 operators are deterministic, no-LLM, `local_python`. Each writes JSON/JSONL working files that are loaded into SQLite at the end.
+
+- **O0 `RunInitializeOperator`** — create the `runs` row and run directory; bootstrap `schema_meta`; seed `operator_specs`. Schema creation is orchestrator setup and carries no domain logic.
+- **O1 `ResearchContractOperator`** — deterministic template → `research_contracts` row (research_type, source policy with allowed pack types/adapters, critical-claim policy) + a generic ontology profile (generic entity + claim types). No LLM.
+- **O2 `QuestionGraphStubOperator`** — one `question_graph_nodes` row (root = topic). *Seam:* Phase 1 replaces the body with generation.
+- **O3 `StaticPlanOperator`** — build the static DAG from `operator_specs`; write `physical_plan_nodes` (each with `runtime`), `physical_plan_edges`, and `optimizer_decisions` (why the plan is static, empty `alternatives_considered`). *Seam:* the optimizer swap point. Validates: registered operators, acyclic DAG, every required table has a producer.
+- **O4 `SourceContainerLoadOperator`** — load `input/source_containers.jsonl` → `source_containers` rows; dedupe by PK; validate item shape per pack type; preserve order as `container_rank`.
+- **O5 `SourceItemSelectOperator`** — expand each container's nested `items` into `selected_source_items` rows (`include_all` in Phase 0); assign `adapter_id` from container type; carry `provider_metadata` through. *Seam:* ranking, deduplication, and budgeting.
+- **O6 `DocumentAcquisitionOperator`** — run the adapter registry; one `acquisition_attempts` row per item + `documents` (raw) on success. *Seam:* the live-retrieval swap point. Missing fixture → failed attempt.
+- **O7 `DocumentNormalizeOperator`** — near-identity normalization (newlines, trim, collapse whitespace, keep paragraph breaks) → `documents.normalized_text` + `content_hash`. *Seam:* Phase 2 swaps the body for HTML/PDF parsing while spans continue to index `normalized_text`.
+- **O8 `SpanSegmentOperator`** — paragraph-first chunker → `spans`; offsets into `normalized_text`; `text_hash`.
+- **O9 `EvidenceCardBuildOperator`** — prefer explicit fixture evidence markers; otherwise use a conservative assertion filter (at least 80 non-whitespace chars, declarative, not boilerplate); record skip metrics. *Seam:* a future LLM extractor can replace the body without changing `evidence`.
+- **O10 `ClaimLiteBuildOperator`** — one `claims` row per evidence row + `claim_evidence` (role=supporting) + `claim_edges` stub; `status=accepted` iff a supporting evidence row exists.
+- **O11 `CitationMapBuildOperator`** — one `citations` row per evidence used by an accepted claim; rejects any citation whose evidence→span→document→item path does not resolve.
+- **O12 `ReportBlueprintOperator`** — write the fixed `report_sections` rows and assign accepted claims via `section_claims`/`section_citations`; reference only existing rows.
+
+### 8.4 PreRenderQualityGateSuite (G)
+
+Deterministic validators run on working files before rendering. Because working files have no enforced foreign keys, these gates check referential integrity before `PersistRunToStore`; SQLite re-confirms references at load. Gates also check path consistency, span offsets, and provider quarantine. Product invariant: **nothing unsupported, unreferenced, or improperly provider-specific reaches the report.**
+
+| Gate | Blocks? | Family | Checks |
+| --- | --- | --- | --- |
+| `RequiredRowsGate` | yes | structural | required tables are populated for this run |
+| `SchemaValidationGate` | yes | structural | rows satisfy column/type/enum constraints |
+| `ProviderFieldQuarantineGate` | **yes** | structural | generic tables carry no provider-specific column or JSON key outside `provider_metadata`; routing columns (`source_pack_type`, `source_family`, `adapter_id`, `document_kind`) may hold provider-named values. Checks names (a whitelist), not values. |
+| `ReferenceIntegrityGate` | yes | referential | checks container→item→attempt→document→span→evidence→claim chains before SQLite load |
+| `SpanOffsetGate` | yes | referential | `normalized_text[start:end] == spans.text` |
+| `ClaimSupportGate` | yes | support | every accepted claim has ≥1 `supporting` `claim_evidence` row |
+| `CriticalClaimGate` | yes | support | critical claims meet `minimum_supporting_evidence` |
+| `CitationResolutionGate` | yes | grounding | every citation resolves the full evidence→span→document→item path |
+| `ReportGroundingGate` | yes | grounding | sections reference accepted claims only; report cites only `citations` rows |
+| `SourceCoverageGate` | conditional | coverage | every supplied container/item appears in coverage or as a gap; **blocks** when fewer than `minimum_source_count` sources are present, warns otherwise |
+| `SourceSetLimitationsGate` | no (warn) | coverage | warns on low source count or missing metadata |
+
+### 8.5 Render, Persist, and Closeout (O13, O14, O15, F, B)
+
+- **O13 `MarkdownReportCompileOperator`** — if the dossier approves rendering, export `final_report.md` from pre-gated sections, accepted claims, and citations. It never creates claims, cites non-`citations` rows, or renders rejected claims. If blocked, export `diagnostic_report.md` instead (run summary, coverage, gaps/failures; no findings). Either export writes an `artifact_exports` row.
+- **O14 `HtmlRenderOperator`** — render the final or diagnostic Markdown to HTML with a Markdown package if available, else a minimal internal renderer. Write an `artifact_exports` row. HTML is a view over the run's artifacts.
+- **O15 `PersistRunToStore`** — after rendering, load every working file into SQLite in one transaction. Foreign keys are the final integrity check; any broken reference fails the load. Applies to finalized, diagnostic-only, and failed runs.
+- **F `FinalCloseoutGate`** — passes only if persistence succeeded *and* the exports are valid: exports exist and are non-empty, every rendered citation resolves to a `citations` row, and no rejected claim appears. If persistence fails, closeout fails, the run is marked `failed`, and its report is recorded as diagnostic, not final.
+- **B `BundleExportOperator`** — export `bundle_manifest.json` (and write `bundle_artifacts`) summarizing the loaded store, the exported files, their hashes, and the final status — `finalized`, `diagnostic_only`, or `failed`.
+
+## 9. Evidence Trace And Data Lineage
+
+```mermaid
+flowchart LR
+  Topic["runs.topic"]
+  Contract["research_contracts"]
+  QG["question_graph_nodes (stub)"]
+  Container["source_containers\n(channel / repo / folder)"]
+  Item["selected_source_items\n(video / file) + provider_metadata"]
+  Attempt["acquisition_attempts"]
+  Doc["documents.raw_text"]
+  Norm["documents.normalized_text"]
+  Span["spans (offsets into normalized_text)"]
+  Evidence["evidence"]
+  Claim["claims + claim_evidence"]
+  Edges["claim_edges (stub)"]
+  Section["report_sections + section_claims"]
+  Cite["citations"]
+  Dossier["quality_dossier"]
+  MD["exports/final_report.md"]
+  HTML["exports/final_report.html"]
+  Closeout["FinalCloseoutGate"]
+  Bundle["bundle_artifacts + bundle_manifest.json"]
+
+  Topic --> Contract --> QG
+  Container --> Item --> Attempt --> Doc --> Norm --> Span --> Evidence --> Claim --> Edges
+  Contract --> Section
+  Claim --> Section
+  Evidence --> Cite
+  Section --> Dossier
+  Cite --> Dossier
+  Span --> Dossier
+  Claim --> Dossier
+  Dossier --> MD --> HTML --> Closeout
+  Dossier --> Bundle
+  Closeout --> Bundle
+```
+
+## 10. Runtime Boundary And Tech Stack
+
+### 10.1 Runtime Choice
+
+Phase 0 uses `LocalPythonRuntime` only. No operator requires network, API keys, background services, a vector store, browser automation, or an LLM. The `runtime` value reserves the Phase 4 Codex seam.
+
+### 10.2 Recommended Implementation Stack
+
+| Concern | Phase 0 Tech | Reason |
 | --- | --- | --- |
-| `SourceSeedCountGate` | exactly 50 channel seeds | block |
-| `ChannelUrlGate` | all URLs parse to channel handles | block |
-| `UniqueSourceGate` | no duplicate canonical channel URLs | block |
-| `SelectedVideoReferenceGate` | each selected video references known channel | block |
-| `TranscriptDocumentGate` | loaded documents reference known selected videos | block for invalid refs, warn for missing transcripts |
-| `SpanReferenceGate` | each span references known document | block |
-| `EvidenceReferenceGate` | each evidence row references known span | block |
-| `FindingEvidenceGate` | accepted findings have evidence IDs | block |
-| `ReportCitationGate` | report citations resolve to evidence IDs | block |
+| CLI | Python `argparse` or Typer | Simple local commands. |
+| Working files | `json` stdlib (JSON/JSONL) | File-first run state; easy to open, diff, debug. |
+| Store | **`sqlite3` (stdlib)**, `PRAGMA foreign_keys=ON` | Durable, queryable load target; FKs are the final integrity check. |
+| Orchestration | Python classes/functions | Visible, testable state. |
+| Models | Pydantic v2 (mirror table rows) | Typed validation around row writes. |
+| IDs/hashes | `uuid`, `hashlib` | Stable PKs and content hashes. |
+| Exports | `json` stdlib; deterministic Markdown templates | Report must not invent content. |
+| HTML | Markdown package if present, else fallback | Run without fragile dependencies. |
+| Tests | `pytest` | Validate contracts and gates. |
 
-Warning gates:
+### 10.3 Operator Invocation Provenance
 
-| Gate | Checks | Warning |
-| --- | --- | --- |
-| `TranscriptCoverageGate` | selected videos with transcripts | warn if below target |
-| `SourceDiversityGate` | findings draw from multiple channels | warn if narrow |
-| `EvidenceVolumeGate` | enough evidence for demo target | warn or block based on contract |
+`operator_invocations` is working JSONL during the run and a store table after load. One row per operator run captures `operator_name`, `operator_version`, `runtime`, timing, `status`, `metrics` JSON, and `error`. It is the provenance record for that operator's outputs.
 
-## 9. HTML Report Design
+## 11. Quality Gate Behavior
 
-The HTML report is the final human-facing product of Phase 0. The JSON/JSONL artifacts remain the source of truth; HTML is the readable research brief assembled from those artifacts.
+```mermaid
+flowchart TD
+  A["Pre-render gates on work files\nstructural, referential, support, grounding"]
+  Q{"Any blocking failure?"}
+  H["dossier: pass/warning\napproved_for_report_rendering=1"]
+  G["dossier: fail\nrepair_tasks written"]
+  RF["Render final_report.md/html"]
+  RD["Render diagnostic_report.md/html\n(coverage + gaps, no findings)"]
+  P["PersistRunToStore\nload run into ai4research.db (FKs = final check)"]
+  C["FinalCloseoutGate\nfinalizes if approved; requires successful persist"]
+  BN["BundleExport\nbundle_manifest.json; finalized | diagnostic_only | failed"]
 
-Rendered artifact:
-
-```text
-report/report.html
+  A --> Q
+  Q -- no --> H --> RF --> P
+  Q -- yes --> G --> RD --> P
+  P --> C --> BN
 ```
 
-### 9.1 Exact Section Order
+Blocking failures: missing required row, constraint violation, provider field on a generic table, broken FK chain, span offset mismatch, accepted claim without supporting evidence, section referencing rejected/missing claims, or unresolvable citation. Low source count and missing metadata are warnings unless they violate the contract minimum.
+
+On a blocked run, the final report is withheld and a **diagnostic report** (`exports/diagnostic_report.md/html`) is exported instead. It contains run summary, source/acquisition coverage, and gaps/failures, but no findings. Every run gets `bundle_manifest.json`.
+
+**Definition of done:** an unsupported critical claim cannot reach the final report. It yields a diagnostic report plus a planned (unexecuted) repair task instead.
+
+## 12. Phase 0 Source Design
+
+Source intake is this source-agnostic flow:
 
 ```text
-1. Executive Run Summary
-   - topic
-   - run date
-   - gate status
-   - source corpus summary
-   - what was actually processed
-   - what the report can and cannot claim
-
-2. Source Coverage
-   - all 50 channels
-   - channel handle
-   - authority type
-   - selected video count
-   - transcript document count
-   - source status and gaps
-
-3. Key Findings
-   - finding text
-   - finding type
-   - strength
-   - confidence
-   - evidence count
-   - source count
-   - linked evidence IDs
-   - limitations
-
-4. Evidence Table
-   - evidence ID
-   - source/channel
-   - video
-   - span/timestamp
-   - summary
-   - quote
-   - limitations
-
-5. Gaps And Repair Tasks
-   - channels not yet used
-   - selected videos missing transcripts
-   - weak findings
-   - warning gates
-   - recommended next operators or manual actions
-
-6. Traceability Appendix
-   - finding -> evidence -> span -> document -> video -> channel
-
-7. Full Source Appendix
-   - exact 50 YouTube channel links
+input/source_containers.jsonl
+  -> SourceContainerLoadOperator  -> source_containers rows
+  -> SourceItemSelectOperator     -> selected_source_items rows
+  -> DocumentAcquisitionOperator  -> acquisition_attempts + documents (raw) rows
+  -> DocumentNormalizeOperator    -> documents.normalized_text
 ```
 
-### 9.2 Page Layout
+### 12.1 Source Layers
 
-The report should use clear whitespace and section bands. It should not be a dense wall of tables.
+| Layer | Table | Meaning | Not Equivalent To |
+| --- | --- | --- | --- |
+| Source container | `source_containers` | a channel / repo / folder | a document or evidence source |
+| Selected source item | `selected_source_items` | a video / file selected for acquisition | retrieved content |
+| Acquisition attempt | `acquisition_attempts` | one adapter attempt | a success unless `status='succeeded'` |
+| Document | `documents` | acquired text | evidence until spans + cards exist |
+| Span | `spans` | exact `normalized_text` interval | a claim |
 
-Practical layout:
+### 12.2 Container/Item Mapping
+
+Per Section 1.2: channel→video, repo→file, folder→file. Phase 0 performs no discovery inside a container; it loads exact user-supplied containers and items. A channel/repo/folder is a *container*, not evidence.
+
+### 12.3 YouTube And GitHub Specializations
+
+A ~50-channel YouTube preset is 50 `source_containers` rows (`youtube_channel`), each with chosen videos as `selected_source_items` (URL + transcript fixture; provider data in `provider_metadata`). A GitHub preset is one container per repo, with chosen files/README as items plus supplied file fixtures. Each item flows to `acquisition_attempts`, then `documents`, normalization, and spans. A channel/repo with no staged item is surfaced by `SourceCoverageGate`.
+
+### 12.4 Source Metadata Completion
+
+Phase 0 does not fetch missing metadata; missing values stay `null` and produce a warning. Later phases add metadata fetch behind the adapter boundary.
+
+## 13. Report And HTML Design
+
+Report path: `accepted claims -> report_sections -> PreRenderQualityGateSuite -> Markdown -> citation label`. Reports are exports compiled from run artifacts.
+
+### 13.1 Exact Section Order
 
 ```text
-+--------------------------------------------------------------------------------+
-| Pipeline A YouTube Research Brief                                              |
-| Topic: Latest technologies in skills governance                                |
-| Run: run-20260528-001   Generated: 2026-05-28   Gate status: PASS              |
-+--------------------------------------------------------------------------------+
-
-+------------+-----------------+--------------------+---------+----------+----------+
-| 50         | 8               | 5                  | 42      | 12       | 5        |
-| Channels   | Selected Videos | Transcript Docs    | Spans   | Evidence | Findings |
-+------------+-----------------+--------------------+---------+----------+----------+
-
-Executive Run Summary
-  This run normalized 50 YouTube channel seeds, registered 8 selected videos,
-  loaded 5 transcript documents, extracted 12 evidence records, and produced
-  5 accepted findings. The brief is based only on selected transcript fixtures,
-  so unused channels and missing transcripts are listed as gaps.
-
-Source Coverage
-  [coverage summary]
-  [50-row channel table]
-
-Key Findings
-  [finding card]
-  [finding card]
-
-Evidence Table
-  [evidence rows]
-
-Gaps And Repair Tasks
-  [missing transcript and weak coverage rows]
-
-Traceability Appendix
-  [finding -> evidence -> span -> document -> video -> channel]
-
-Full Source Appendix
-  [all 50 source seeds]
+1. Executive Run Summary        (topic, run ID, gate status, source pack summary, what was processed, what can/cannot be claimed)
+2. Source And Acquisition Coverage (containers, selected items, successful + failed/skipped attempts, missing metadata, gaps)
+3. Evidence-Backed Findings     (accepted claims, citation labels, evidence count, limitations)
+4. Evidence Table               (evidence ID, item, document, span, summary, excerpt, limitations)
+5. Gaps And Repair Tasks        (failed acquisitions, warning gates, weak coverage, repair tasks)
+6. Traceability Appendix        (claim -> evidence -> span -> document -> selected item -> source container)
+7. Full Source Appendix         (every supplied container and item, including unused seeds)
 ```
 
-### 9.3 Example Finding Card
+Coverage and traceability precede findings to make Phase 0's limits visible.
 
-```text
-FND-001  Trend  Strength: moderate  Confidence: 0.62
+### 13.2 Markdown Template Shape
 
-Skills governance discussions increasingly connect AI inference, data quality,
-and organizational accountability.
+```markdown
+# Phase 0 Evidence Report: <topic>
 
-Evidence:
-  EV-003-001  Microsoft Research / Example video / SP-003-001-004
-  EV-022-004  Google DeepMind / Example video / SP-022-002-001
+## Executive Run Summary
+Run <run_id> processed <N> supplied items (<M> acquired, <K> gaps). Gate status: <status>. No live retrieval.
 
-Limitations:
-  YouTube-only Phase 0 source set; selected transcript fixture sample.
+## Source And Acquisition Coverage
+- <container/item coverage table, including failed/skipped attempts>
+
+## Evidence-Backed Findings
+- <claim_text> [CITE0001]
+
+## Limitations And Next Retrieval Needs
+- The source set was user supplied; live acquisition is Phase 2.
 ```
 
-Finding display rules:
+### 13.3 HTML Layout
 
-- accepted findings appear in `Key Findings`
-- tentative findings may appear only if clearly labeled
-- blocked or unsupported findings must not appear as normal findings
-- every accepted finding must show evidence IDs
-- single-source findings should show a source-diversity warning
+Readable view over run artifacts: header (topic, run ID, time, gate status); metrics row (containers, items, documents, spans, evidence, claims); coverage table; findings; evidence table; gaps and repair tasks; traceability appendix; bundle list.
 
-### 9.4 Source Coverage Table
+### 13.4 Report Data Dependencies
 
-The Source Coverage section must show all 50 channels, not only the channels used for evidence.
-
-| Column | Source Field | Format |
-| --- | --- | --- |
-| Seed ID | `seed_id` | `YS-003` |
-| Source ID | `source_id` | `SRC-YT-003` |
-| Name | `name` | plain text |
-| Handle | `youtube_handle` | `@MicrosoftResearch` |
-| Channel URL | `canonical_url` | clickable link |
-| Authority Type | `authority_type` | label |
-| Selected Videos | derived count | integer |
-| Transcript Docs | derived count | integer |
-| Status | `status` | `registered`, `invalid`, `duplicate`, `unused` |
-| Notes | `status_reason` or gap summary | short text |
-
-Rows with no selected video should stay visible:
-
-```text
-selected_videos = 0
-status = registered
-notes = not yet used in Phase 0 evidence sample
-```
-
-### 9.5 Evidence Table
-
-| Column | Source Field | Format |
-| --- | --- | --- |
-| Evidence ID | `evidence_id` | `EV-003-001` |
-| Type | `evidence_type` | label |
-| Summary | `summary` | 1-2 sentences |
-| Quote | `quote` | short excerpt |
-| Source | `source_id` + channel name | `SRC-YT-003 Microsoft Research` |
-| Video | video title and URL | clickable if available |
-| Span | `span_id` | `SP-003-001-004` |
-| Timestamp | `youtube_timestamp_url` | clickable if available |
-| Relevance | `relevance` | low/medium/high |
-| Quality | `source_quality` | low/medium/high |
-| Limitations | `limitations[]` | semicolon-separated |
-
-Timestamp display:
-
-```text
-timestamp available:
-  Watch @ 02:00
-
-timestamp missing:
-  Transcript span
-```
-
-### 9.6 Gaps And Repair Tasks
-
-This section is required because Phase 0 is intentionally partial.
-
-It should show:
-
-- channels with no selected video
-- selected videos with missing transcripts
-- findings with weak or single-source support
-- warning gate results
-- blocking gate results if the report is diagnostic only
-- recommended next operator or manual action
-
-Repair task table:
-
-| Column | Meaning |
+| Report Area | Source Tables |
 | --- | --- |
-| Task ID | stable repair task ID |
-| Severity | warning or blocking |
-| Problem | concise issue |
-| Artifact | artifact that caused the issue |
-| Record ID | specific row if available |
-| Suggested Operator | next operator to run later |
-| Human Action | manual action that can fix it |
+| Header | `runs`, `research_contracts`, `quality_dossier` |
+| Metrics | container/item/document/span/evidence/claim tables |
+| Coverage | `source_containers`, `selected_source_items`, `acquisition_attempts` |
+| Findings | `claims`, `claim_evidence`, `evidence`, `citations` |
+| Evidence table | `evidence`, `spans`, `documents` |
+| Gaps | `gate_results`, `repair_tasks` |
+| Traceability | `claim_edges`, `citations`, FK chains |
+| Bundle list | `bundle_artifacts`, `artifact_exports` |
 
-### 9.7 Traceability Appendix
+### 13.5 Report Acceptance Criteria
 
-Columns:
+Exports open as local Markdown + HTML. Topic, run ID, and gate status appear near the top. Findings render only from accepted claims. Every citation resolves to a `citations` row. Failed/skipped acquisitions and warning gates are visible. Rejected/unsupported claims never appear as findings.
 
-```text
-finding_id
-evidence_id
-span_id
-document_id
-video_id
-source_id
-channel_handle
-url_or_timestamp
-```
+## 14. Test Plan
 
-Example:
+### 14.1 Unit Tests
 
-```text
-FND-001 -> EV-003-001 -> SP-003-001-004 -> DOC-003-001 -> VID-003-001 -> SRC-YT-003 -> @MicrosoftResearch -> youtube timestamp
-```
-
-### 9.8 HTML Data Dependency Table
-
-| HTML Area | Data Source |
+| Test | Expected Result |
 | --- | --- |
-| Header | `bundle/manifest.json`, `contract/research_contract.json` |
-| Metrics | `sources/channel_coverage_summary.json`, `evidence/evidence_ledger.jsonl`, `findings/findings.jsonl` |
-| Source coverage | `sources/channel_sources.jsonl`, `sources/selected_videos.jsonl` |
-| Findings | `findings/findings.jsonl`, `findings/finding_evidence_links.jsonl` |
-| Evidence table | `evidence/evidence_ledger.jsonl`, `spans/spans.jsonl` |
-| Gaps | `gates/quality_dossier.json`, `repair/repair_tasks.jsonl` |
-| Traceability | `report/finding_traceability_table.json` |
-| Appendix | `input/youtube_channels.jsonl` |
-
-### 9.9 HTML Acceptance Criteria
-
-- The report opens as a single local HTML file.
-- The report shows topic, run metadata, and gate status near the top.
-- The report shows all 50 channel seeds somewhere in the source appendix.
-- The report shows selected videos and transcript availability.
-- Accepted findings always show evidence IDs.
-- Evidence rows always link back to spans.
-- Missing transcripts and unused channels are visible as gaps.
-- Gate warnings and blocking failures are visible.
-- The traceability appendix reconstructs finding -> evidence -> span -> document -> video -> channel.
-
-## 10. Build Order
-
-### Day 1: Source Spine
-
-Build:
-
-- run directory creator
-- `youtube_channels.jsonl`
-- `ResearchContract`
-- channel URL parser
-- `ChannelSource`
-- source coverage summary
-- parser tests
-
-Demo by end of day:
-
-```text
-topic + 50 channel seeds -> source coverage JSON
-```
-
-### Day 2: Video And Transcript Fixtures
-
-Build:
-
-- `video_candidates.jsonl` format
-- selected video registration
-- transcript fixture loader
-- TXT/VTT/SRT/JSON parser
-- transcript document and segment schemas
-
-Demo by end of day:
-
-```text
-selected videos + fixtures -> transcript_documents.jsonl + transcript_segments.jsonl
-```
-
-### Day 3: Spans, Evidence, Findings
-
-Build:
-
-- span extractor
-- evidence ledger schema
-- evidence extraction path
-- finding builder
-- traceability links
-
-Demo by end of day:
-
-```text
-transcripts -> spans -> evidence -> findings
-```
-
-### Day 4: Gates And Repairs
-
-Build:
-
-- source gates
-- reference gates
-- finding support gate
-- report citation gate
-- quality dossier
-- repair task writer
-- negative tests
-
-Demo by end of day:
-
-```text
-unsupported finding fails before report finalization
-```
-
-### Day 5: Report And Bundle
-
-Build:
-
-- Markdown report compiler
-- HTML view model
-- HTML renderer
-- source appendix
-- evidence table
-- bundle manifest
-- integration test
-
-Demo by end of day:
-
-```text
-one command creates a full Phase 0 YouTube research bundle
-```
-
-## 11. Test Plan
-
-### Unit Tests
-
-```text
-test_channel_seed_count_is_50
-test_channel_urls_parse_to_unique_handles
-test_duplicate_channel_urls_fail
-test_selected_video_references_known_source
-test_transcript_document_references_selected_video
-test_span_references_known_document
-test_evidence_references_known_span
-test_finding_references_known_evidence
-test_report_citations_reference_known_evidence
-```
-
-### Integration Test
-
-Input:
-
-```text
-topic
-50 channel seeds
-5 selected videos
-3 transcript fixtures
-```
-
-Expected:
-
-```text
-run directory exists
-channel_sources.jsonl has 50 rows
-selected_videos.jsonl has at least 5 rows
-transcript_documents.jsonl has at least 3 rows
-spans.jsonl has nonzero rows
-evidence_ledger.jsonl has at least 8 rows
-findings.jsonl has at least 4 rows
-blocking gates pass
-report/report.html exists
-bundle/manifest.json exists
-```
-
-### Negative Tests
-
-```text
-malformed channel URL
-  -> ChannelUrlGate fails
-
-selected video references unknown source_id
-  -> SelectedVideoReferenceGate fails
-
-evidence references missing span_id
-  -> EvidenceReferenceGate fails
-
-accepted finding has no evidence_ids
-  -> FindingEvidenceGate fails
-
-report cites nonexistent evidence_id
-  -> ReportCitationGate fails
-```
-
-## 12. Transition To Later Phases
-
-### Phase 1
-
-Add task-aware planning without changing the evidence spine.
-
-```text
-Phase 0:
-  fixed physical plan
-
-Phase 1:
-  rule-based planner selects source families and operators
-```
-
-### Phase 2
-
-Replace manual fixtures with real retrieval where appropriate.
-
-```text
-Phase 0:
-  local transcript fixtures
-
-Phase 2:
-  YouTube transcript adapter
-  metadata adapter
-  retrieval connectors
-```
-
-Outputs stay compatible:
-
-```text
-ChannelSource
-VideoCandidate
-TranscriptDocument
-Span
-EvidenceRecord
-Finding
-```
-
-### Phase 3
-
-Upgrade flat findings into a full claim graph.
-
-```text
-Phase 0:
-  findings.jsonl
-
-Phase 3:
-  claim_graph.json
-  claim_evidence_edges.jsonl
-  contradiction records
-  section contracts
-```
-
-### Phase 4
-
-Use Codex as an agentic runtime for selected operators.
-
-Good candidates:
-
-```text
-EvidenceExtractOperator
-FindingBuildOperator
-ReportSectionDraftOperator
-RepairSuggestionOperator
-```
-
-Boundary:
-
-```text
-Codex may generate candidate artifacts.
-Pipeline A validates and gates them.
-Codex does not declare the run accepted.
-```
-
-## 13. User Decisions Needed
-
-These should be decided explicitly rather than hidden as assumptions.
-
-1. What is the first demo topic?
-2. Should Phase 0 selected videos be manually supplied, or should we attempt limited live YouTube metadata retrieval?
-3. How many selected videos should the first demo target: 5, 10, or 20?
-4. Should missing transcripts be a warning or a blocking error?
-5. Should evidence extraction be manual/rule-based only, or can an LLM propose candidate evidence for Python validation?
-6. Should the HTML report target technical readers, executive readers, or a hybrid?
-
-## 14. Definition Of Done
-
-Phase 0 is done when:
-
-```text
-A local command can take a topic and the 50 YouTube channel seeds,
-create a run directory, normalize the channel sources, register selected videos,
-load transcript fixtures, create spans, create evidence, create findings,
-run gates, block unsupported outputs, and render a self-contained HTML report
-where each finding traces back to evidence, span, document, video, and channel records.
-```
+| Empty topic rejected | `ResearchContractOperator` fails validation |
+| Question graph has one root node | valid; >1 root fails |
+| Plan node missing `runtime` | `StaticPlanOperator` hard fails |
+| Duplicate container / item PKs | insert fails / loader hard fails |
+| Missing fixture creates failed attempt | failed `acquisition_attempts` row; rendering blocked only if coverage thresholds unmet |
+| Normalized hash stable | same input → same `content_hash` |
+| Span offsets valid | `normalized_text[start:end] == spans.text` |
+| Provider field on a generic table | `ProviderFieldQuarantineGate` hard fails |
+| Evidence FK to missing span | DB rejects insert / `ReferenceIntegrityGate` hard fails |
+| Accepted claim with no `claim_evidence` | `ClaimSupportGate` hard fails |
+| Citation path unresolvable | `CitationResolutionGate` hard fails |
+| Section references unsupported claim | `ReportGroundingGate` hard fails before rendering |
+
+### 14.2 Integration Test (the proving run)
+
+Required input: topic "latest technologies in skills governance"; one `input/source_containers.jsonl` with **two families** — `local_document_set` (one `.md`) and `youtube_channel` (a few project channels, each with chosen videos + transcript fixtures). `github_repo` with a README fixture is an optional additional case after the GitHub adapter exists; it is not required for core Phase 0 completion.
+
+Pass condition:
+- **Source-agnostic execution:** every supplied family flows through the same spine to `final_report.html`.
+- **Preset coverage:** the coverage table lists every supplied container/item, including any channel/repo without a fixture.
+- **Stable contracts:** traceability reconstructs final sentence → claim → evidence → span → document → item → container for at least one claim per family.
+- Gates pass (`SourceCoverageGate`/`SourceSetLimitationsGate` as warnings).
+
+### 14.3 Negative Integration Test
+
+Input: a `youtube_channel` item with a missing fixture path, plus a fixture containing an unsupported critical claim. Expected: failed `acquisition_attempts` row; unsupported critical claim blocked by `CriticalClaimGate`; no final report; `diagnostic_report.md/html` exported; `repair_tasks` row written; `bundle_artifacts.bundle_status = diagnostic_only` (or `failed`).
+
+### 14.4 Contract Tests For Later Phases
+
+Contract guarantee; must pass throughout Phases 1–4:
+- A new `SourceAdapter` (a stub "Phase 2" adapter) flows through the unchanged spine and produces the same `selected_source_items`/`documents`/`spans`/`evidence`/`claims` row shapes.
+- Replacing `StaticPlanOperator` with a stub rule optimizer changes `optimizer_decisions` rows but not the `physical_plan_*` schema the executor consumes.
+- Setting a plan node's `runtime` to a non-`local_python` value is accepted by the schema (dispatch mocked) — proving the Phase 4 seam.
+- Replacing `QuestionGraphStubOperator` with a multi-node generator does not change any downstream consumer.
+
+## 15. Phase 0 Decisions
+
+1. Working state during a run is file-first (JSON/JSONL under `work/`); `PersistRunToStore` loads each finished run into a single SQLite store as the durable record.
+2. Per-record metadata envelopes are replaced by PKs, FKs, `operator_invocations`, `artifact_exports`, and `schema_meta`.
+3. Channel/repo = container; video/file = item; transcript/file text = document.
+4. Any positive number of items; counts are contract config, never hardcoded.
+5. YouTube/GitHub acquisition requires supplied fixtures; network fetching is a later adapter.
+6. One claim per evidence row; multiple claims per span deferred.
+7. `published_at`/provider metadata optional; missing → warning.
+8. Pydantic v2 models serialize to both working files and store rows; working files are canonical during the run, SQLite after load.
+9. Gates run before rendering; rendering is blocked unless the dossier approves it. `PersistRunToStore` loads the run after rendering, and `FinalCloseoutGate` runs last and passes only if the load succeeded; then the bundle manifest is written.
+10. `local_document_file` is the required adapter that proves the spine; `youtube_transcript_fixture` is built after it and required for the proving run (Section 14.2); `github_file_fixture` is optional.
+11. The source-agnostic rule is enforced by a blocking gate.
+
+## 16. Build Order
+
+Thin-first; every step ends runnable.
+
+1. **Schema, models, and storage layer.** Pydantic v2 models for every Section 7 table; a working-file reader/writer (JSON/JSONL under `work/`); the SQLite schema (Sections 6–7, `PRAGMA foreign_keys=ON`) and a `PersistRunToStore` loader; seed `schema_meta`.
+2. `operator_specs` registry + `Operator` base + topological `OperatorRunner` + `StaticPlanOperator` (every node `runtime=local_python`) + `operator_invocations` writing.
+3. `RunInitializeOperator`, `ResearchContractOperator`, `QuestionGraphStubOperator`.
+4. `SourceAdapter` interface + **`local_document_file` adapter only** + `SourceContainerLoadOperator` + `SourceItemSelectOperator` + `DocumentAcquisitionOperator` (writes attempts + documents). **First green run on one local `.md`** proves the spine before YouTube/GitHub adapters.
+5. `DocumentNormalizeOperator` → `SpanSegmentOperator` → `EvidenceCardBuildOperator` → `ClaimLiteBuildOperator` (+ `claim_evidence`) → `CitationMapBuildOperator` → `ReportBlueprintOperator` (writes `report_sections` + `section_claims`/`section_citations`).
+6. `PreRenderQualityGateSuite` (incl. `ProviderFieldQuarantineGate`) + finalize/diagnostic branch.
+7. `MarkdownReportCompileOperator` → `HtmlRenderOperator` → `PersistRunToStore` (load run into the store) → `FinalCloseoutGate` (requires successful persist) → `BundleExportOperator` (+ `artifact_exports`, diagnostic + failed manifests).
+8. **After the core spine:** the `youtube_transcript_fixture` adapter (required for the proving run) and the optional `github_file_fixture` adapter, both through the unchanged interface; then the §14.2 proving run.
+9. Unit, negative, and §14.4 contract tests.
+
+## 17. Transition To Later Phases
+
+Phase 0's table contracts and executor must survive later phases. Each transition is "replace a body" or "add behind a seam," not "reshape the schema."
+
+**Phase 1 — planning intelligence:** domain-profile selection; replace `QuestionGraphStubOperator` body with real generation; logical plan + rule-based optimizer (swaps `StaticPlanOperator` internals behind the unchanged `physical_plan_*` tables); richer blueprints. New operators register in `operator_specs`.
+
+**Phase 2 — real source acquisition:** live connectors behind the `SourceAdapter` interface (YouTube transcript fetch, GitHub API, web/PDF); ranking/dedup in `SourceItemSelectOperator`; real `DocumentNormalizeOperator` bodies for HTML/PDF (spans still index `normalized_text`); a span/evidence schema *extension* for structured GitHub metrics; ontology mapping; claim entailment/contradiction; score-based optimizer.
+
+**Phase 3 — research compilation hardening:** full claim-graph semantics; contradiction rows; section evidence packets; repair-task *execution* (Phase 0 only recorded them); bundle hardening.
+
+**Phase 4 — Codex / agent runtimes behind operator contracts:** Python owns run state (working files during the run, SQLite after load), validation, gates, and finalization; selected plan nodes dispatch to Codex workers via `runtime`; worker outputs validate into rows before use; gates, not workers, decide whether a run passes.
