@@ -1,0 +1,1 @@
+{"container_id": "C-DOC-001", "source_pack_type": "local_document_set", "label": "Local notes pack", "items": [{"item_id": "I-DOC-001-01", "item_locator": {"local_path": "tests/fixtures/docs/notes.md"}, "title": "Notes on skills governance technology"}]}

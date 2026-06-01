@@ -1,0 +1,9 @@
+# Generated run artifacts and the SQLite store (regenerable; not source)
+runs/
+outputs/
+*.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/

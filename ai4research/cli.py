@@ -1,0 +1,73 @@
+"""Command-line interface. `ai4research demo --topic ... --source-pack <file>` runs the
+Phase 0 spine over a source pack, renders the report, and loads the run into the store.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import sys
+from pathlib import Path
+
+from . import ids
+from .finalize import FinalizeResult, finalize
+from .operators import OperatorRunner, RunFailed, build_pipeline
+from .runtime import RunContext
+from .workfiles import WorkStore
+
+
+def cmd_demo(args: argparse.Namespace) -> int:
+    runs_dir = Path(args.runs_dir).resolve()
+    ctx = RunContext(ids.new_run_id(), runs_dir)
+    ctx.ensure_dirs()
+
+    # Stage inputs: the topic and the user-supplied source pack.
+    (ctx.input_dir / "topic.json").write_text(
+        json.dumps({"topic": args.topic}, indent=2), encoding="utf-8"
+    )
+    shutil.copyfile(Path(args.source_pack).resolve(), ctx.input_dir / "source_containers.jsonl")
+
+    work = WorkStore(ctx)
+    rc = 0
+    try:
+        OperatorRunner(build_pipeline()).run(ctx, work)
+    except RunFailed as exc:
+        rc = 1
+        print(f"[operator failed] {exc}", file=sys.stderr)
+
+    # Persist, closeout, bundle (runs for finalized, diagnostic-only, and failed runs).
+    result = finalize(ctx, work)
+    if result.status == "failed":
+        rc = 1
+    _print_summary(ctx, result)
+    return rc
+
+
+def _print_summary(ctx: RunContext, result: FinalizeResult) -> None:
+    print(f"run_id : {ctx.run_id}")
+    print(f"status : {result.status}")
+    print(f"report : {result.report_path or '(none)'}")
+    print(f"store  : {ctx.db_path if result.persisted else '(not persisted)'}")
+    if result.persist_error:
+        print(f"persist error: {result.persist_error}")
+    print("loaded :")
+    for table, n in result.counts.items():
+        print(f"  {table}: {n}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="ai4research", description="Pipeline A — Phase 0")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    demo = sub.add_parser("demo", help="run the Phase 0 spine over a source pack")
+    demo.add_argument("--topic", required=True)
+    demo.add_argument("--source-pack", required=True, help="path to a source_containers.jsonl")
+    demo.add_argument("--runs-dir", default="runs")
+    demo.set_defaults(func=cmd_demo)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
