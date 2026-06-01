@@ -14,6 +14,7 @@ class AcquireResult:
     text: str | None = None
     title: str | None = None
     document_kind: str | None = None
+    provider_metadata: dict | None = None
     failure_code: str | None = None
     failure_message: str | None = None
 

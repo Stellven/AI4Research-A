@@ -41,6 +41,16 @@ def _nonws_len(s: str) -> int:
 
 def _classify(text_lower: str) -> str:
     """Generic evidence type from surface cues (design §7.10 enum). No domain vocabulary."""
+    if '"' in text_lower:  # an actual quotation; a lone apostrophe (it's, org's) is NOT a quote
+        return "quote"
+    if any(k in text_lower for k in ("repository metrics", "stars:", "benchmark", "sha", "commit")):
+        return "benchmark"
+    if "release" in text_lower:
+        return "product_release"
+    if any(k in text_lower for k in ("code", "api", "identifier", "schema", "repository")):
+        return "code"
+    if any(k in text_lower for k in ("policy", "governance", "standard", "compliance")):
+        return "policy"
     if any(k in text_lower for k in ("risk", "should not", "must not", "vulnerab", "danger")):
         return "risk"
     if any(k in text_lower for k in ("should ", "recommend", "best practice", "ought to")):
@@ -50,6 +60,48 @@ def _classify(text_lower: str) -> str:
     if any(k in text_lower for k in ("for example", "e.g.", "such as")):
         return "example"
     return "source_statement"
+
+
+def _scoring_weights(work: WorkStore) -> dict:
+    contract = (work.read_rows("research_contracts") or [{}])[0]
+    pack_id = contract.get("domain_pack_id")
+    for row in work.read_rows("domain_packs"):
+        if row.get("pack_id") == pack_id:
+            return row.get("scoring_weights") or {}
+    return {}
+
+
+def _github_quality_score(provider_metadata: dict | None, scoring_weights: dict) -> float | None:
+    if not isinstance(provider_metadata, dict):
+        return None
+    stars = provider_metadata.get("stars")
+    scale = scoring_weights.get("github_stars_full_scale")
+    try:
+        stars_value = float(stars)
+        scale_value = float(scale)
+    except (TypeError, ValueError):
+        return None
+    if scale_value <= 0:
+        return None
+    return min(1.0, stars_value / scale_value)
+
+
+def _github_metrics_block(provider_metadata: dict | None) -> str:
+    if not isinstance(provider_metadata, dict):
+        return ""
+    parts = []
+    if provider_metadata.get("stars") is not None:
+        parts.append(f"stars: {provider_metadata['stars']}")
+    if provider_metadata.get("releases_in_window") is not None:
+        parts.append(f"releases in window: {provider_metadata['releases_in_window']}")
+    if provider_metadata.get("last_release") is not None:
+        parts.append(f"last release: {provider_metadata['last_release']}")
+    if not parts:
+        return ""
+    return (
+        "Repository metrics - " + "; ".join(parts)
+        + ". These repository metrics are included as evidence for source quality and activity.\n\n"
+    )
 
 
 def _first_sentence(s: str, limit: int = 240) -> str:
@@ -70,8 +122,13 @@ class DocumentNormalizeOperator(Operator):
 
     def run(self, ctx: RunContext, work: WorkStore, pipeline: list[Operator]) -> dict:
         n = 0
+        scoring_weights = _scoring_weights(work)
         for doc in work.read_documents():
-            normalized = text.normalize(doc["raw_text"])
+            raw_text = doc["raw_text"]
+            if doc.get("document_kind") == "github_document":
+                raw_text = _github_metrics_block(doc.get("provider_metadata")) + raw_text
+                doc["source_quality_score"] = _github_quality_score(doc.get("provider_metadata"), scoring_weights)
+            normalized = text.normalize(raw_text)
             doc["normalized_text"] = normalized
             doc["content_hash"] = ids.sha256_text(normalized)  # canonical-text hash
             doc["normalization"] = {"rules_applied": text.NORMALIZATION_RULES, "removed_content": False}
@@ -130,7 +187,7 @@ class EvidenceCardBuildOperator(Operator):
                 continue
             evidence_type = _classify(span_text.lower())
             doc = docs.get(span["document_id"], {})
-            rows.append({
+            row = {
                 "evidence_id": ids.mint(ctx.run_id, "EV", len(rows)),
                 "run_id": ctx.run_id,
                 "selected_item_id": span["selected_item_id"],
@@ -142,7 +199,10 @@ class EvidenceCardBuildOperator(Operator):
                 "support_strength": "single_source",
                 "limitations": [],
                 "published_at": doc.get("published_at"),
-            })
+            }
+            if "source_quality_score" in doc:
+                row["source_quality_score"] = doc.get("source_quality_score")
+            rows.append(row)
         work.write_rows("evidence", rows)
         return {"spans_considered": considered, "evidence_built": len(rows), "spans_skipped": skipped}
 
@@ -207,6 +267,7 @@ class CitationMapBuildOperator(Operator):
                 dropped += 1
                 continue
             locator = item.get("item_locator") or {}
+            citation_url = _citation_url(locator, doc, span)
             rows.append({
                 "citation_id": ids.mint(ctx.run_id, "CITE", len(rows)),
                 "run_id": ctx.run_id,
@@ -215,11 +276,50 @@ class CitationMapBuildOperator(Operator):
                 "document_id": ev["document_id"],
                 "selected_item_id": ev["selected_item_id"],
                 "label": f"CITE{len(rows) + 1:04d}",
-                "url": locator.get("url"),
+                "url": citation_url,
                 "accessed_at": item.get("accessed_at"),
             })
         work.write_rows("citations", rows)
         return {"citations": len(rows), "dropped_unresolvable": dropped}
+
+
+def _citation_url(locator: dict, doc: dict, span: dict) -> str | None:
+    base_url = locator.get("url")
+    if not base_url:
+        return None
+    if doc.get("document_kind") == "github_document":
+        normalized = doc.get("normalized_text") or ""
+        start_line = 1 + normalized[:span["start_char"]].count("\n")
+        end_line = 1 + normalized[:span["end_char"]].count("\n")
+        return f"{base_url}#L{start_line}-L{end_line}"
+    if doc.get("document_kind") == "youtube_transcript":
+        seconds = _youtube_seconds_for_span(doc.get("provider_metadata"), span["start_char"])
+        if seconds is not None:
+            return f"{base_url}&t={seconds}s"
+    return base_url
+
+
+def _youtube_seconds_for_span(provider_metadata: dict | None, start_char: int) -> int | None:
+    if not isinstance(provider_metadata, dict):
+        return None
+    segments = provider_metadata.get("segments")
+    if not isinstance(segments, list):
+        return None
+    selected = None
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        segment_start = segment.get("start_char")
+        if not isinstance(segment_start, int):
+            continue
+        if segment_start <= start_char:
+            selected = segment
+        else:
+            break
+    if selected is None:
+        return None
+    seconds = selected.get("start_seconds")
+    return seconds if isinstance(seconds, int) else None
 
 
 class ReportBlueprintOperator(Operator):

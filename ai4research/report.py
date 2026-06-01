@@ -6,6 +6,7 @@ no findings) instead. A minimal Markdown->HTML renderer keeps the run dependency
 from __future__ import annotations
 
 import html as _html
+import re
 
 from .workfiles import WorkStore
 
@@ -87,7 +88,10 @@ def _findings(d: ReportData) -> list[str]:
         for eid in support.get(c["claim_id"], []):
             cite = d.cite_by_evidence.get(eid)
             if cite:
-                labels.append(f"[{cite['label']}]")
+                if cite.get("url"):
+                    labels.append(f"[{cite['label']}]({cite['url']})")
+                else:
+                    labels.append(f"[{cite['label']}]")
         suffix = (" " + " ".join(labels)) if labels else ""
         out.append(f"- {c['claim_text']}{suffix}")
     out.append("")
@@ -230,4 +234,5 @@ def _html_table(rows: list[str]) -> str:
 def _inline(s: str) -> str:
     s = _html.escape(s)
     s = s.replace("**", "")  # drop bold markers; minimal renderer
+    s = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', s)
     return s.replace("`", "")

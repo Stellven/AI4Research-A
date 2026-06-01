@@ -45,10 +45,13 @@ def cmd_demo(args: argparse.Namespace) -> int:
     (ctx.input_dir / "topic.json").write_text(
         json.dumps({"topic": args.topic}, indent=2), encoding="utf-8"
     )
+    run_config = {}
     if args.max_per_container is not None:
-        (ctx.input_dir / "run_config.json").write_text(
-            json.dumps({"max_items_per_container": args.max_per_container}, indent=2), encoding="utf-8"
-        )
+        run_config["max_items_per_container"] = args.max_per_container
+    if args.domain_pack is not None:
+        run_config["domain_pack"] = args.domain_pack
+    if run_config:
+        (ctx.input_dir / "run_config.json").write_text(json.dumps(run_config, indent=2), encoding="utf-8")
     stage_source_pack(Path(args.source_pack).resolve(), ctx.input_dir / "source_containers.jsonl")
 
     work = WorkStore(ctx)
@@ -88,6 +91,7 @@ def main(argv: list[str] | None = None) -> int:
     demo.add_argument("--source-pack", required=True, help="path to a source_containers.jsonl")
     demo.add_argument("--runs-dir", default="runs")
     demo.add_argument("--max-per-container", type=int, default=None)
+    demo.add_argument("--domain-pack", default=None)
     demo.set_defaults(func=cmd_demo)
 
     args = parser.parse_args(argv)

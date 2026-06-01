@@ -70,9 +70,23 @@ CREATE TABLE artifact_exports (           -- ONLY files written to disk
   created_at     TEXT NOT NULL
 );
 
+CREATE TABLE domain_packs (
+  pack_id TEXT PRIMARY KEY,
+  version TEXT NOT NULL,
+  source_families TEXT NOT NULL,
+  freshness_window_days INTEGER,
+  max_items_per_container INTEGER,
+  vocabulary TEXT NOT NULL,
+  scoring_weights TEXT NOT NULL,
+  required_sections TEXT NOT NULL,
+  required_gates TEXT NOT NULL,
+  question_template TEXT NOT NULL
+);
+
 CREATE TABLE research_contracts (
   contract_id    TEXT PRIMARY KEY,
   run_id         TEXT NOT NULL REFERENCES runs(run_id),
+  domain_pack_id TEXT REFERENCES domain_packs(pack_id),
   topic          TEXT NOT NULL,
   research_type  TEXT NOT NULL,           -- 'source_pack_evidence_report'
   audience       TEXT,
@@ -153,6 +167,7 @@ CREATE TABLE documents (
   language             TEXT,
   published_at         TEXT,
   content_hash         TEXT NOT NULL,
+  source_quality_score REAL,
   normalization        TEXT,              -- JSON: rules_applied, removed_content
   provider_metadata    TEXT               -- JSON: video_id, repo sha, ...
 );
@@ -181,7 +196,8 @@ CREATE TABLE evidence (
   quoted_text      TEXT NOT NULL,         -- contained within the span text
   support_strength TEXT,
   limitations      TEXT,                  -- JSON array
-  published_at     TEXT
+  published_at     TEXT,
+  source_quality_score REAL
 );
 
 CREATE TABLE claims (
@@ -258,7 +274,8 @@ CREATE TABLE quality_dossier (
   overall_status               TEXT NOT NULL,   -- pass | warning | fail
   blocking_gate_failures       INTEGER NOT NULL,
   warning_count                INTEGER NOT NULL,
-  approved_for_report_rendering INTEGER NOT NULL
+  approved_for_report_rendering INTEGER NOT NULL,
+  coverage                     TEXT             -- JSON: QuestionCoverageGate coverage summary
 );
 
 CREATE TABLE repair_tasks (

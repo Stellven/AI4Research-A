@@ -9,6 +9,8 @@ before `PersistRunToStore`; SQLite re-confirms references at load.
 """
 from __future__ import annotations
 
+import re
+
 from .. import ids
 from ..adapters import SOURCE_PACK_MAP
 from ..runtime import RunContext
@@ -33,7 +35,8 @@ _GENERIC_TABLE_COLUMNS = {
     "spans": {"span_id", "run_id", "document_id", "selected_item_id", "span_index",
               "start_char", "end_char", "text", "segmentation_strategy", "text_hash"},
     "evidence": {"evidence_id", "run_id", "selected_item_id", "document_id", "span_id",
-                 "evidence_type", "summary", "quoted_text", "support_strength", "limitations", "published_at"},
+                 "evidence_type", "summary", "quoted_text", "support_strength", "limitations",
+                 "published_at", "source_quality_score"},
     "claims": {"claim_id", "run_id", "claim_type", "claim_text", "claim_scope",
                "criticality", "status", "confidence", "limitations"},
     "claim_evidence": {"claim_id", "evidence_id", "role"},
@@ -53,7 +56,8 @@ def _enums() -> dict[tuple[str, str], set[str]]:
     ("source_containers", "source_pack_type"): set(SOURCE_PACK_MAP),
     ("documents", "document_kind"): {doc_kind for _, _, doc_kind in SOURCE_PACK_MAP.values()},
     ("evidence", "evidence_type"): {"definition", "source_statement", "example", "risk",
-                                    "recommendation", "limitation", "unknown"},
+                                    "recommendation", "limitation", "unknown", "quote",
+                                    "benchmark", "code", "policy", "product_release"},
     ("claims", "claim_type"): {"definition", "technical_fact", "risk_claim", "recommendation_claim"},
     ("claims", "status"): {"draft", "accepted", "qualified", "rejected"},
     ("claims", "criticality"): {"normal", "critical"},
@@ -297,16 +301,62 @@ def gate_source_set_limitations(s, contract):
                    issues, {"missing_metadata": missing_meta, "failed_attempts": failed})
 
 
+_STOPWORDS = {
+    "about", "above", "after", "also", "from", "have", "into", "most", "noted", "that",
+    "their", "there", "these", "they", "this", "what", "when", "where", "which", "with",
+}
+
+
+def _keywords(value: str) -> set[str]:
+    return {tok for tok in re.findall(r"[a-z0-9]+", value.lower()) if len(tok) > 3 and tok not in _STOPWORDS}
+
+
+def gate_question_coverage(s, contract):
+    sub_questions = [q for q in s.get("question_graph_nodes", []) if q.get("type") == "sub_question"]
+    if not sub_questions:
+        return _ok("QuestionCoverageGate", WARN, ["question_graph_nodes"], {"covered": [], "uncovered": []})
+    accepted = {c["claim_id"]: c for c in s.get("claims", []) if c.get("status") == "accepted"}
+    supporting_evidence_ids = {
+        ce["evidence_id"] for ce in s.get("claim_evidence", []) if ce.get("claim_id") in accepted
+    }
+    corpus = []
+    corpus.extend(c.get("claim_text", "") for c in accepted.values())
+    corpus.extend(
+        (e.get("summary", "") + " " + e.get("quoted_text", ""))
+        for e in s.get("evidence", [])
+        if not supporting_evidence_ids or e.get("evidence_id") in supporting_evidence_ids
+    )
+    corpus_keywords = set()
+    for value in corpus:
+        corpus_keywords.update(_keywords(value))
+
+    covered = []
+    uncovered = []
+    for question in sub_questions:
+        question_keywords = _keywords(question.get("text", ""))
+        if question_keywords & corpus_keywords:
+            covered.append(question["node_id"])
+        else:
+            uncovered.append(question["node_id"])
+    metrics = {"covered": covered, "uncovered": uncovered}
+    if uncovered:
+        issues = [f"uncovered sub-question: {q['text']}" for q in sub_questions if q["node_id"] in uncovered]
+        return _result("QuestionCoverageGate", WARNING, WARN, ["question_graph_nodes", "claims", "evidence"],
+                       issues, metrics)
+    return _ok("QuestionCoverageGate", WARN, ["question_graph_nodes", "claims", "evidence"], metrics)
+
+
 GATES = [
     gate_required_rows, gate_schema_validation, gate_provider_quarantine,
     gate_reference_integrity, gate_span_offsets, gate_claim_support, gate_critical_claim,
     gate_citation_resolution, gate_report_grounding, gate_source_coverage, gate_source_set_limitations,
+    gate_question_coverage,
 ]
 
 
 def _snapshot(work: WorkStore) -> dict:
     tables = ["runs", "research_contracts", "question_graph_nodes", "physical_plan_nodes",
-              "physical_plan_edges", "source_containers", "selected_source_items",
+              "question_graph_edges", "physical_plan_edges", "source_containers", "selected_source_items",
               "acquisition_attempts", "spans", "evidence", "claims", "claim_evidence",
               "claim_edges", "citations", "report_sections", "section_claims", "section_citations"]
     snap = {t: work.read_rows(t) for t in tables}
@@ -348,6 +398,7 @@ class PreRenderQualityGateSuiteOperator(Operator):
 
         overall = "fail" if blocking_failures else ("warning" if warnings else "pass")
         approved = 0 if blocking_failures else 1
+        coverage = next((r["metrics"] for r in results if r["gate_id"] == "QuestionCoverageGate"), {})
         work.write_rows("gate_results", results)
         work.write_rows("repair_tasks", repair_tasks)
         work.write_rows("quality_dossier", [{
@@ -356,6 +407,7 @@ class PreRenderQualityGateSuiteOperator(Operator):
             "blocking_gate_failures": blocking_failures,
             "warning_count": warnings,
             "approved_for_report_rendering": approved,
+            "coverage": coverage,
         }])
         return {"gates": len(results), "blocking_failures": blocking_failures,
                 "warnings": warnings, "approved": approved}

@@ -21,6 +21,8 @@ SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 JSON_COLS: dict[str, set[str]] = {
     "operator_specs": {"input_schemas", "output_schemas"},
     "optimizer_decisions": {"alternatives_considered"},
+    "domain_packs": {"source_families", "vocabulary", "scoring_weights",
+                     "required_sections", "required_gates", "question_template"},
     "research_contracts": {"source_policy", "required_dimensions", "critical_claim_policy", "deliverables"},
     "selected_source_items": {"item_locator", "provider_metadata"},
     "acquisition_attempts": {"input_locator"},
@@ -28,6 +30,7 @@ JSON_COLS: dict[str, set[str]] = {
     "evidence": {"limitations"},
     "claims": {"limitations"},
     "gate_results": {"checked_tables", "issues", "metrics"},
+    "quality_dossier": {"coverage"},
     "operator_invocations": {"metrics"},
 }
 
@@ -35,7 +38,7 @@ JSON_COLS: dict[str, set[str]] = {
 # `bundle_artifacts` is written by the bundle step after the bulk load.
 _PERSIST_ORDER: list[str] = [
     "runs", "operator_specs", "physical_plan_nodes", "physical_plan_edges",
-    "optimizer_decisions", "research_contracts", "question_graph_nodes", "question_graph_edges",
+    "optimizer_decisions", "domain_packs", "research_contracts", "question_graph_nodes", "question_graph_edges",
     "source_containers", "selected_source_items", "acquisition_attempts", "documents",
     "spans", "evidence", "claims", "claim_evidence", "claim_edges", "citations",
     "report_sections", "section_claims", "section_citations",
@@ -43,7 +46,7 @@ _PERSIST_ORDER: list[str] = [
 ]
 
 # Global registry (PK not run-scoped); the same operators recur every run, so upsert.
-_OR_IGNORE: set[str] = {"operator_specs"}
+_OR_IGNORE: set[str] = {"operator_specs", "domain_packs"}
 
 
 def connect(db_path: Path) -> sqlite3.Connection:

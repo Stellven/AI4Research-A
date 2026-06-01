@@ -15,7 +15,7 @@ class StoreTest(unittest.TestCase):
                 n = conn.execute(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
                 ).fetchone()[0]
-                self.assertGreaterEqual(n, 28)
+                self.assertGreaterEqual(n, 29)
                 # foreign keys are enforced
                 self.assertEqual(conn.execute("PRAGMA foreign_keys").fetchone()[0], 1)
                 # idempotent: a second init on a populated db is a no-op (does not raise)

@@ -11,6 +11,7 @@ from ai4research.operators import OperatorRunner, build_pipeline
 from ai4research.operators import RunFailed
 from ai4research.operators import gates as G
 from ai4research.operators.base import Operator, validate_plan
+from ai4research.operators.extraction import _classify
 from tests import support
 
 _TABLES = ["runs", "research_contracts", "question_graph_nodes", "physical_plan_nodes",
@@ -78,6 +79,13 @@ class DeterministicTextTest(unittest.TestCase):
         self.assertGreater(len(spans), 0)
         for start, end, span_text in spans:
             self.assertEqual(normalized[start:end], span_text)
+
+    def test_apostrophe_is_not_classified_as_quote(self):
+        # a possessive/contraction apostrophe must NOT be read as a quotation
+        self.assertNotEqual(_classify("the organization's taxonomy is governed by policy."), "quote")
+        self.assertNotEqual(_classify("we're adopting verifiable credentials."), "quote")
+        # an actual double-quoted quotation IS a quote
+        self.assertEqual(_classify('the report states "skills must be auditable" here.'), "quote")
 
 
 class GateTest(unittest.TestCase):

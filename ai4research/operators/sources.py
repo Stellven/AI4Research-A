@@ -155,6 +155,9 @@ class DocumentAcquisitionOperator(Operator):
             item["acquisition_status"] = "acquired" if ok else "failed"
             if ok and res is not None:
                 document_id = ids.mint(ctx.run_id, "DOC", docs)
+                provider_metadata = item.get("provider_metadata") or {}
+                if res.provider_metadata:
+                    provider_metadata = {**provider_metadata, **res.provider_metadata}
                 work.write_document({
                     "document_id": document_id,
                     "run_id": ctx.run_id,
@@ -168,7 +171,7 @@ class DocumentAcquisitionOperator(Operator):
                     "published_at": item.get("published_at"),
                     "content_hash": ids.sha256_text(res.text),
                     "normalization": None,
-                    "provider_metadata": item.get("provider_metadata"),
+                    "provider_metadata": provider_metadata or None,
                 })
                 succeeded += 1
                 docs += 1
