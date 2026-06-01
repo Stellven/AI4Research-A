@@ -15,7 +15,7 @@ class SpineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ctx, work = support.stage(tmp, support.PROVING_TOPIC, [support.local_container()])
             invocations = support.run_pipeline(ctx, work)
-            self.assertEqual(len(invocations), 16)
+            self.assertEqual(len(invocations), len(build_pipeline()))
             self.assertTrue(all(i["status"] == "success" for i in invocations))
 
             from ai4research.finalize import finalize

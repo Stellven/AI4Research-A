@@ -7,6 +7,8 @@ replace an operator body (e.g. O9) without changing the row shapes downstream.
 """
 from __future__ import annotations
 
+import re
+
 from .. import ids, text
 from ..runtime import RunContext
 from ..workfiles import WorkStore
@@ -221,12 +223,14 @@ class ClaimLiteBuildOperator(Operator):
                 "claim_id": claim_id,
                 "run_id": ctx.run_id,
                 "claim_type": claim_type,
+                "claim_kind": "extractive",
                 "claim_text": ev["summary"],
                 "claim_scope": "within provided source set",
                 "criticality": "normal",  # the spine never invents criticality; the gate enforces policy
                 "status": "accepted",      # accepted iff a supporting evidence row exists (added below)
                 "confidence": "supported_by_source",
                 "limitations": [],
+                "derivation": None,
             })
             links.append({"claim_id": claim_id, "evidence_id": ev["evidence_id"], "role": "supporting"})
             edges.append({"run_id": ctx.run_id, "from_id": ev["evidence_id"], "to_id": claim_id, "type": "supports"})
@@ -234,6 +238,183 @@ class ClaimLiteBuildOperator(Operator):
         work.write_rows("claim_evidence", links)
         work.write_rows("claim_edges", edges)
         return {"claims": len(claims), "accepted": len(claims)}
+
+
+def _numeric(value) -> float | int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return int(number) if number.is_integer() else number
+
+
+def _repo_label(item: dict, doc: dict) -> str:
+    return item.get("title") or doc.get("title") or item["selected_item_id"].rsplit(".", 1)[-1]
+
+
+class MetricSynthesisOperator(Operator):
+    NAME = "MetricSynthesisOperator"
+    INPUT_SCHEMAS = ["claims", "evidence", "documents"]
+    OUTPUT_SCHEMAS = ["claims", "claim_evidence", "claim_edges"]
+
+    def run(self, ctx: RunContext, work: WorkStore, pipeline: list[Operator]) -> dict:
+        contract = (work.read_rows("research_contracts") or [{}])[0]
+        if contract.get("domain_pack_id") == "generic":
+            return {"comparison_claims": 0, "trend_claims": 0}
+
+        docs = {d["document_id"]: d for d in work.read_documents()}
+        items = {i["selected_item_id"]: i for i in work.read_rows("selected_source_items")}
+        metric_evidence = {}
+        for ev in work.read_rows("evidence"):
+            doc = docs.get(ev["document_id"])
+            if (doc and doc.get("document_kind") == "github_document"
+                    and ev.get("quoted_text", "").startswith("Repository metrics")):
+                metric_evidence[ev["document_id"]] = ev
+
+        repos = []
+        for doc_id, ev in metric_evidence.items():
+            doc = docs[doc_id]
+            item = items.get(doc["selected_item_id"])
+            metadata = doc.get("provider_metadata") if isinstance(doc.get("provider_metadata"), dict) else {}
+            if not item:
+                continue
+            repos.append({
+                "doc": doc,
+                "item": item,
+                "evidence": ev,
+                "label": _repo_label(item, doc),
+                "stars": _numeric(metadata.get("stars")),
+                "releases": _numeric(metadata.get("releases_in_window")),
+            })
+
+        claims = work.read_rows("claims")
+        links = work.read_rows("claim_evidence")
+        edges = work.read_rows("claim_edges")
+        comparison_claims = trend_claims = 0
+
+        star_repos = [repo for repo in repos if repo["stars"] is not None]
+        star_repos.sort(key=lambda repo: (-float(repo["stars"]), repo["label"]))
+        if len(star_repos) >= 2 and float(star_repos[1]["stars"]) != 0:
+            top, runner_up = star_repos[0], star_repos[1]
+            ratio = round(float(top["stars"]) / float(runner_up["stars"]), 2)
+            claim_id = ids.mint(ctx.run_id, "CLAIM", len(claims))
+            derivation = {
+                "method": "star_ratio",
+                "inputs": [
+                    {"evidence_id": top["evidence"]["evidence_id"], "label": top["label"], "value": top["stars"]},
+                    {"evidence_id": runner_up["evidence"]["evidence_id"], "label": runner_up["label"],
+                     "value": runner_up["stars"]},
+                ],
+                "computed": {"ratio": ratio},
+            }
+            claims.append({
+                "claim_id": claim_id,
+                "run_id": ctx.run_id,
+                "claim_type": "comparison_claim",
+                "claim_kind": "comparative",
+                "claim_text": f"Repo {top['label']} has {ratio}x the stars of Repo {runner_up['label']} "
+                              f"({top['stars']} vs {runner_up['stars']}).",
+                "claim_scope": "within provided source set",
+                "criticality": "normal",
+                "status": "accepted",
+                "confidence": "computed_from_metrics",
+                "limitations": [],
+                "derivation": derivation,
+            })
+            for inp in derivation["inputs"]:
+                links.append({"claim_id": claim_id, "evidence_id": inp["evidence_id"], "role": "supporting"})
+            edges.append({
+                "run_id": ctx.run_id,
+                "from_id": top["item"]["selected_item_id"],
+                "to_id": runner_up["item"]["selected_item_id"],
+                "type": "compares_to",
+            })
+            comparison_claims += 1
+
+        for repo in repos:
+            if repo["releases"] is None:
+                continue
+            claim_id = ids.mint(ctx.run_id, "CLAIM", len(claims))
+            derivation = {
+                "method": "release_count",
+                "inputs": [{"evidence_id": repo["evidence"]["evidence_id"], "label": repo["label"],
+                            "value": repo["releases"]}],
+                "computed": {"count": repo["releases"]},
+            }
+            claims.append({
+                "claim_id": claim_id,
+                "run_id": ctx.run_id,
+                "claim_type": "trend_claim",
+                "claim_kind": "synthesized",
+                "claim_text": f"Repo {repo['label']} had {repo['releases']} releases in the window.",
+                "claim_scope": "within provided source set",
+                "criticality": "normal",
+                "status": "accepted",
+                "confidence": "computed_from_metrics",
+                "limitations": [],
+                "derivation": derivation,
+            })
+            links.append({"claim_id": claim_id, "evidence_id": repo["evidence"]["evidence_id"], "role": "supporting"})
+            trend_claims += 1
+
+        work.write_rows("claims", claims)
+        work.write_rows("claim_evidence", links)
+        work.write_rows("claim_edges", edges)
+        return {"comparison_claims": comparison_claims, "trend_claims": trend_claims}
+
+
+def _term_pattern(term: str):
+    escaped = re.escape(term.lower())
+    return re.compile(rf"(?<![a-z0-9]){escaped}(?![a-z0-9])")
+
+
+class EntityTagOperator(Operator):
+    NAME = "EntityTagOperator"
+    INPUT_SCHEMAS = ["claims"]
+    OUTPUT_SCHEMAS = ["entities", "claim_entities"]
+
+    def run(self, ctx: RunContext, work: WorkStore, pipeline: list[Operator]) -> dict:
+        contract = (work.read_rows("research_contracts") or [{}])[0]
+        pack_id = contract.get("domain_pack_id")
+        pack = next((p for p in work.read_rows("domain_packs") if p.get("pack_id") == pack_id), {})
+        vocabulary = pack.get("vocabulary") or []
+        if not vocabulary:
+            work.write_rows("entities", [])
+            work.write_rows("claim_entities", [])
+            return {"entities": 0, "links": 0}
+
+        entities_by_name = {}
+        links = []
+        seen_links = set()
+        for claim in work.read_rows("claims"):
+            if claim.get("status") != "accepted":
+                continue
+            text_lower = claim.get("claim_text", "").lower()
+            for entry in vocabulary:
+                terms = [entry["canonical"]] + list(entry.get("synonyms") or [])
+                if not any(_term_pattern(term).search(text_lower) for term in terms):
+                    continue
+                canonical = entry["canonical"]
+                if canonical not in entities_by_name:
+                    entities_by_name[canonical] = {
+                        "entity_id": ids.mint(ctx.run_id, "ENT", len(entities_by_name)),
+                        "run_id": ctx.run_id,
+                        "canonical_name": canonical,
+                        "entity_type": entry.get("entity_type") or "Entity",
+                        "synonyms": entry.get("synonyms") or [],
+                        "domain_tags": [],
+                    }
+                key = (claim["claim_id"], entities_by_name[canonical]["entity_id"])
+                if key not in seen_links:
+                    links.append({"claim_id": key[0], "entity_id": key[1]})
+                    seen_links.add(key)
+
+        entities = list(entities_by_name.values())
+        work.write_rows("entities", entities)
+        work.write_rows("claim_entities", links)
+        return {"entities": len(entities), "links": len(links)}
 
 
 class CitationMapBuildOperator(Operator):
@@ -325,12 +506,16 @@ def _youtube_seconds_for_span(provider_metadata: dict | None, start_char: int) -
 class ReportBlueprintOperator(Operator):
     NAME = "ReportBlueprintOperator"
     INPUT_SCHEMAS = ["claims", "citations"]
-    OUTPUT_SCHEMAS = ["report_sections", "section_claims", "section_citations"]
+    OUTPUT_SCHEMAS = ["report_sections", "figures", "section_claims", "section_citations"]
 
     def run(self, ctx: RunContext, work: WorkStore, pipeline: list[Operator]) -> dict:
         sections = []
         findings_id = None
-        for order_index, (heading, purpose) in enumerate(REPORT_SECTIONS):
+        contract = (work.read_rows("research_contracts") or [{}])[0]
+        pack = next((p for p in work.read_rows("domain_packs") if p.get("pack_id") == contract.get("domain_pack_id")), {})
+        section_purposes = dict(REPORT_SECTIONS)
+        headings = pack.get("required_sections") or [heading for heading, _ in REPORT_SECTIONS]
+        for order_index, heading in enumerate(headings):
             section_id = ids.mint(ctx.run_id, "SEC", order_index)
             if heading == FINDINGS_HEADING:
                 findings_id = section_id
@@ -338,11 +523,12 @@ class ReportBlueprintOperator(Operator):
                 "section_id": section_id,
                 "run_id": ctx.run_id,
                 "heading": heading,
-                "purpose": purpose,
+                "purpose": section_purposes.get(heading),
                 "order_index": order_index,
                 "section_status": "ready",
             })
         work.write_rows("report_sections", sections)
+        work.write_rows("figures", _figure_rows(ctx, work))
 
         # Findings cite accepted claims and their citations; the other sections render
         # directly from tables (coverage, gaps, traceability, appendix).
@@ -352,3 +538,35 @@ class ReportBlueprintOperator(Operator):
             {"section_id": findings_id, "citation_id": c["citation_id"]} for c in work.read_rows("citations")
         ])
         return {"sections": len(sections), "findings_claims": len(accepted)}
+
+
+def _figure_rows(ctx: RunContext, work: WorkStore) -> list[dict]:
+    claims = [
+        c for c in work.read_rows("claims")
+        if c.get("status") == "accepted" and c.get("claim_kind") in ("synthesized", "comparative")
+    ]
+    if not claims:
+        return []
+    repos: dict[str, dict] = {}
+    grounded_claim_ids = []
+    for claim in claims:
+        grounded_claim_ids.append(claim["claim_id"])
+        derivation = claim.get("derivation") or {}
+        method = derivation.get("method")
+        for inp in derivation.get("inputs", []):
+            label = inp.get("label")
+            if not label:
+                continue
+            row = repos.setdefault(label, {"repo": label, "stars": None, "releases": None})
+            if method == "star_ratio":
+                row["stars"] = inp.get("value")
+            elif method == "release_count":
+                row["releases"] = inp.get("value")
+    rows = [[r["repo"], r["stars"], r["releases"]] for r in sorted(repos.values(), key=lambda r: r["repo"])]
+    return [{
+        "figure_id": ids.mint(ctx.run_id, "FIG", 0),
+        "run_id": ctx.run_id,
+        "kind": "comparison_matrix",
+        "spec": {"columns": ["repo", "stars", "releases"], "rows": rows},
+        "grounded_claim_ids": grounded_claim_ids,
+    }]

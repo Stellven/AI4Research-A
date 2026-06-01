@@ -28,7 +28,9 @@ JSON_COLS: dict[str, set[str]] = {
     "acquisition_attempts": {"input_locator"},
     "documents": {"normalization", "provider_metadata"},
     "evidence": {"limitations"},
-    "claims": {"limitations"},
+    "claims": {"limitations", "derivation"},
+    "entities": {"synonyms", "domain_tags"},
+    "figures": {"spec", "grounded_claim_ids"},
     "gate_results": {"checked_tables", "issues", "metrics"},
     "quality_dossier": {"coverage"},
     "operator_invocations": {"metrics"},
@@ -40,8 +42,8 @@ _PERSIST_ORDER: list[str] = [
     "runs", "operator_specs", "physical_plan_nodes", "physical_plan_edges",
     "optimizer_decisions", "domain_packs", "research_contracts", "question_graph_nodes", "question_graph_edges",
     "source_containers", "selected_source_items", "acquisition_attempts", "documents",
-    "spans", "evidence", "claims", "claim_evidence", "claim_edges", "citations",
-    "report_sections", "section_claims", "section_citations",
+    "spans", "evidence", "claims", "entities", "claim_entities", "claim_evidence", "claim_edges", "citations",
+    "report_sections", "figures", "section_claims", "section_citations",
     "gate_results", "quality_dossier", "repair_tasks", "operator_invocations", "artifact_exports",
 ]
 

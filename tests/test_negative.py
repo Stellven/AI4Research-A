@@ -38,8 +38,9 @@ class NegativeRunTest(unittest.TestCase):
             self._tmp.name, support.PROVING_TOPIC, [support.local_container(), _missing_fixture_channel()]
         )
         pipeline = build_pipeline()
-        # Run O0-O12 (everything up to, but not including, the gate suite at index 13).
-        OperatorRunner(pipeline[:13]).run(self.ctx, self.work)
+        # Run everything up to, but not including, the gate suite.
+        gate_index = next(i for i, op in enumerate(pipeline) if op.NAME == "PreRenderQualityGateSuite")
+        OperatorRunner(pipeline[:gate_index]).run(self.ctx, self.work)
 
         # Raise the critical-claim bar to 2 supporting evidence rows.
         contracts = self.work.read_rows("research_contracts")
@@ -53,9 +54,10 @@ class NegativeRunTest(unittest.TestCase):
         claims = self.work.read_rows("claims")
         claims.append({
             "claim_id": claim_id, "run_id": self.ctx.run_id, "claim_type": "risk_claim",
+            "claim_kind": "extractive",
             "claim_text": "A critical security control is required.",
             "claim_scope": "within provided source set", "criticality": "critical",
-            "status": "accepted", "confidence": None, "limitations": [],
+            "status": "accepted", "confidence": None, "limitations": [], "derivation": None,
         })
         self.work.write_rows("claims", claims)
         links = self.work.read_rows("claim_evidence")

@@ -30,6 +30,7 @@ class ReportData:
         self.claims = rows("claims")
         self.claim_evidence = rows("claim_evidence")
         self.citations = rows("citations")
+        self.figures = rows("figures")
         self.approved = bool(self.dossier.get("approved_for_report_rendering"))
 
         self.by_item = {i["selected_item_id"]: i for i in self.items}
@@ -114,6 +115,25 @@ def _evidence_table(d: ReportData) -> list[str]:
     return out
 
 
+def _figures(d: ReportData) -> list[str]:
+    out = []
+    for fig in d.figures:
+        if fig.get("kind") != "comparison_matrix":
+            continue
+        spec = fig.get("spec") or {}
+        columns = spec.get("columns") or []
+        rows = spec.get("rows") or []
+        if not columns or not rows:
+            continue
+        out += ["### Grounded Comparison Matrix", ""]
+        out.append("| " + " | ".join(str(c) for c in columns) + " |")
+        out.append("| " + " | ".join("---" for _ in columns) + " |")
+        for row in rows:
+            out.append("| " + " | ".join("—" if value is None else str(value) for value in row) + " |")
+        out.append("")
+    return out
+
+
 def _gaps(d: ReportData) -> list[str]:
     out = ["## Gaps And Repair Tasks", ""]
     failed = [a for a in d.attempts if a["status"] != "succeeded"]
@@ -170,7 +190,7 @@ def render_markdown(d: ReportData) -> tuple[str, str]:
     topic = d.run.get("topic", "")
     if d.approved:
         title = f"Phase 0 Evidence Report: {topic}"
-        body = (_summary(d) + _coverage(d) + _findings(d) + _evidence_table(d)
+        body = (_summary(d) + _coverage(d) + _findings(d) + _figures(d) + _evidence_table(d)
                 + _gaps(d) + _traceability(d) + _full_source_appendix(d))
         kind = "markdown_report"
     else:

@@ -22,7 +22,7 @@ SPAN_COLS = {"span_id", "run_id", "document_id", "selected_item_id", "span_index
 EVIDENCE_COLS = {"evidence_id", "run_id", "selected_item_id", "document_id", "span_id",
                  "evidence_type", "summary", "quoted_text", "support_strength", "limitations", "published_at"}
 CLAIM_COLS = {"claim_id", "run_id", "claim_type", "claim_text", "claim_scope",
-              "criticality", "status", "confidence", "limitations"}
+              "claim_kind", "criticality", "status", "confidence", "limitations", "derivation"}
 
 
 def _swap(index: int, op: Operator) -> list[Operator]:

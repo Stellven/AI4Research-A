@@ -22,7 +22,9 @@ from .extraction import (
     CitationMapBuildOperator,
     ClaimLiteBuildOperator,
     DocumentNormalizeOperator,
+    EntityTagOperator,
     EvidenceCardBuildOperator,
+    MetricSynthesisOperator,
     ReportBlueprintOperator,
     SpanSegmentOperator,
 )
@@ -49,6 +51,8 @@ def build_pipeline() -> list[Operator]:
         SpanSegmentOperator(),
         EvidenceCardBuildOperator(),
         ClaimLiteBuildOperator(),
+        MetricSynthesisOperator(),
+        EntityTagOperator(),
         CitationMapBuildOperator(),
         ReportBlueprintOperator(),
         PreRenderQualityGateSuiteOperator(),

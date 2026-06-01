@@ -203,13 +203,15 @@ CREATE TABLE evidence (
 CREATE TABLE claims (
   claim_id     TEXT PRIMARY KEY,
   run_id       TEXT NOT NULL REFERENCES runs(run_id),
-  claim_type   TEXT NOT NULL,             -- definition|technical_fact|risk_claim|recommendation_claim
+  claim_type   TEXT NOT NULL,             -- definition|technical_fact|risk_claim|recommendation_claim|trend_claim|comparison_claim
+  claim_kind   TEXT NOT NULL DEFAULT 'extractive', -- extractive|synthesized|comparative
   claim_text   TEXT NOT NULL,
   claim_scope  TEXT NOT NULL,             -- 'within provided source set'
   criticality  TEXT NOT NULL DEFAULT 'normal',  -- normal | critical
   status       TEXT NOT NULL,             -- draft | accepted | qualified | rejected
   confidence   TEXT,
-  limitations  TEXT                       -- JSON array
+  limitations  TEXT,                      -- JSON array
+  derivation   TEXT                       -- JSON: {method, inputs, computed}
 );
 CREATE TABLE claim_evidence (
   claim_id     TEXT NOT NULL REFERENCES claims(claim_id),
@@ -222,7 +224,22 @@ CREATE TABLE claim_edges (
   run_id  TEXT NOT NULL REFERENCES runs(run_id),
   from_id TEXT NOT NULL,                  -- claim_id or evidence_id
   to_id   TEXT NOT NULL,
-  type    TEXT NOT NULL                   -- supports | qualifies | refutes | cited_by | belongs_to_section
+  type    TEXT NOT NULL                   -- supports | qualifies | refutes | cited_by | belongs_to_section | compares_to
+);
+
+CREATE TABLE entities (
+  entity_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(run_id),
+  canonical_name TEXT NOT NULL,
+  entity_type TEXT NOT NULL,
+  synonyms TEXT,
+  domain_tags TEXT
+);
+
+CREATE TABLE claim_entities (
+  claim_id TEXT NOT NULL REFERENCES claims(claim_id),
+  entity_id TEXT NOT NULL REFERENCES entities(entity_id),
+  PRIMARY KEY (claim_id, entity_id)
 );
 
 CREATE TABLE citations (
@@ -245,6 +262,15 @@ CREATE TABLE report_sections (
   order_index INTEGER NOT NULL,
   section_status TEXT NOT NULL DEFAULT 'ready'
 );
+
+CREATE TABLE figures (
+  figure_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(run_id),
+  kind TEXT NOT NULL,                 -- comparison_matrix
+  spec TEXT NOT NULL,                 -- JSON: {columns:[...], rows:[[...]]}
+  grounded_claim_ids TEXT NOT NULL    -- JSON array; every row traces to a claim
+);
+
 CREATE TABLE section_claims (
   section_id TEXT NOT NULL REFERENCES report_sections(section_id),
   claim_id   TEXT NOT NULL REFERENCES claims(claim_id),
@@ -275,7 +301,8 @@ CREATE TABLE quality_dossier (
   blocking_gate_failures       INTEGER NOT NULL,
   warning_count                INTEGER NOT NULL,
   approved_for_report_rendering INTEGER NOT NULL,
-  coverage                     TEXT             -- JSON: QuestionCoverageGate coverage summary
+  coverage                     TEXT,            -- JSON: QuestionCoverageGate coverage summary
+  grounding_level              TEXT NOT NULL DEFAULT 'traceable' -- traceable|entailment_checked
 );
 
 CREATE TABLE repair_tasks (

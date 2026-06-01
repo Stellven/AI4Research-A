@@ -38,7 +38,7 @@ _GENERIC_TABLE_COLUMNS = {
                  "evidence_type", "summary", "quoted_text", "support_strength", "limitations",
                  "published_at", "source_quality_score"},
     "claims": {"claim_id", "run_id", "claim_type", "claim_text", "claim_scope",
-               "criticality", "status", "confidence", "limitations"},
+               "claim_kind", "criticality", "status", "confidence", "limitations", "derivation"},
     "claim_evidence": {"claim_id", "evidence_id", "role"},
     "citations": {"citation_id", "run_id", "evidence_id", "span_id", "document_id",
                   "selected_item_id", "label", "url", "accessed_at"},
@@ -58,10 +58,13 @@ def _enums() -> dict[tuple[str, str], set[str]]:
     ("evidence", "evidence_type"): {"definition", "source_statement", "example", "risk",
                                     "recommendation", "limitation", "unknown", "quote",
                                     "benchmark", "code", "policy", "product_release"},
-    ("claims", "claim_type"): {"definition", "technical_fact", "risk_claim", "recommendation_claim"},
+    ("claims", "claim_type"): {"definition", "technical_fact", "risk_claim", "recommendation_claim",
+                               "trend_claim", "comparison_claim"},
+    ("claims", "claim_kind"): {"extractive", "synthesized", "comparative"},
     ("claims", "status"): {"draft", "accepted", "qualified", "rejected"},
     ("claims", "criticality"): {"normal", "critical"},
     ("claim_evidence", "role"): {"supporting", "contradicting", "qualifying"},
+    ("claim_edges", "type"): {"supports", "qualifies", "refutes", "cited_by", "belongs_to_section", "compares_to"},
     }
 _REQUIRED_TABLES = ["runs", "research_contracts", "question_graph_nodes",
                     "physical_plan_nodes", "source_containers", "selected_source_items"]
@@ -71,7 +74,7 @@ _REQUIRED_COLUMNS = {
     "documents": ["document_id", "selected_item_id", "content_hash"],
     "spans": ["span_id", "document_id", "start_char", "end_char", "text"],
     "evidence": ["evidence_id", "span_id", "summary", "quoted_text"],
-    "claims": ["claim_id", "claim_type", "status"],
+    "claims": ["claim_id", "claim_type", "claim_kind", "status"],
     "citations": ["citation_id", "evidence_id", "label"],
 }
 _PRIMARY_KEYS = {
@@ -267,6 +270,59 @@ def gate_report_grounding(s, contract):
                    ["section_claims", "section_citations", "claims", "citations"], issues)
 
 
+def gate_synthesis_grounding(s, contract):
+    evidence = {e["evidence_id"]: e for e in s.get("evidence", [])}
+    issues = []
+    for claim in s.get("claims", []):
+        if claim.get("claim_kind") not in ("synthesized", "comparative"):
+            continue
+        derivation = claim.get("derivation")
+        if not isinstance(derivation, dict):
+            issues.append(f"synthesized claim {claim.get('claim_id')} missing derivation")
+            continue
+        inputs = derivation.get("inputs") or []
+        for inp in inputs:
+            if inp.get("evidence_id") not in evidence:
+                issues.append(f"synthesized claim {claim.get('claim_id')} references missing evidence {inp.get('evidence_id')}")
+        method = derivation.get("method")
+        computed = derivation.get("computed") or {}
+        try:
+            if method == "star_ratio":
+                if len(inputs) < 2:
+                    issues.append(f"synthesized claim {claim.get('claim_id')} star_ratio needs two inputs")
+                    continue
+                denominator = float(inputs[1]["value"])
+                if denominator == 0:
+                    issues.append(f"synthesized claim {claim.get('claim_id')} star_ratio denominator is zero")
+                    continue
+                ratio = round(float(inputs[0]["value"]) / denominator, 2)
+                if computed.get("ratio") != ratio:
+                    issues.append(f"synthesized claim {claim.get('claim_id')} star_ratio mismatch")
+            elif method == "release_count":
+                if len(inputs) < 1:
+                    issues.append(f"synthesized claim {claim.get('claim_id')} release_count needs one input")
+                    continue
+                if computed.get("count") != inputs[0].get("value"):
+                    issues.append(f"synthesized claim {claim.get('claim_id')} release_count mismatch")
+            else:
+                issues.append(f"synthesized claim {claim.get('claim_id')} unknown method {method!r}")
+        except (TypeError, ValueError, KeyError):
+            issues.append(f"synthesized claim {claim.get('claim_id')} derivation is not recomputable")
+    status, sev = (HARD_FAIL, BLOCKING) if issues else (PASS, BLOCKING)
+    return _result("SynthesisGroundingGate", status, sev, ["claims", "evidence"], issues)
+
+
+def gate_figure_grounding(s, contract):
+    accepted = {c["claim_id"] for c in s.get("claims", []) if c.get("status") == "accepted"}
+    issues = []
+    for fig in s.get("figures", []):
+        for claim_id in fig.get("grounded_claim_ids") or []:
+            if claim_id not in accepted:
+                issues.append(f"figure {fig.get('figure_id')} references missing/non-accepted claim {claim_id}")
+    status, sev = (HARD_FAIL, BLOCKING) if issues else (PASS, BLOCKING)
+    return _result("FigureGroundingGate", status, sev, ["figures", "claims"], issues)
+
+
 def gate_source_coverage(s, contract):
     minimum = int(contract.get("source_policy", {}).get("minimum_source_count", 1))
     containers = s["source_containers"]
@@ -349,7 +405,8 @@ def gate_question_coverage(s, contract):
 GATES = [
     gate_required_rows, gate_schema_validation, gate_provider_quarantine,
     gate_reference_integrity, gate_span_offsets, gate_claim_support, gate_critical_claim,
-    gate_citation_resolution, gate_report_grounding, gate_source_coverage, gate_source_set_limitations,
+    gate_citation_resolution, gate_report_grounding, gate_synthesis_grounding, gate_figure_grounding,
+    gate_source_coverage, gate_source_set_limitations,
     gate_question_coverage,
 ]
 
@@ -358,7 +415,7 @@ def _snapshot(work: WorkStore) -> dict:
     tables = ["runs", "research_contracts", "question_graph_nodes", "physical_plan_nodes",
               "question_graph_edges", "physical_plan_edges", "source_containers", "selected_source_items",
               "acquisition_attempts", "spans", "evidence", "claims", "claim_evidence",
-              "claim_edges", "citations", "report_sections", "section_claims", "section_citations"]
+              "claim_edges", "citations", "report_sections", "figures", "section_claims", "section_citations"]
     snap = {t: work.read_rows(t) for t in tables}
     snap["documents"] = work.read_documents()
     return snap
@@ -366,7 +423,7 @@ def _snapshot(work: WorkStore) -> dict:
 
 class PreRenderQualityGateSuiteOperator(Operator):
     NAME = "PreRenderQualityGateSuite"
-    INPUT_SCHEMAS = ["claims", "citations", "spans", "evidence", "report_sections"]
+    INPUT_SCHEMAS = ["claims", "citations", "spans", "evidence", "report_sections", "figures"]
     OUTPUT_SCHEMAS = ["gate_results", "quality_dossier", "repair_tasks"]
 
     def run(self, ctx: RunContext, work: WorkStore, pipeline: list[Operator]) -> dict:
@@ -408,6 +465,7 @@ class PreRenderQualityGateSuiteOperator(Operator):
             "warning_count": warnings,
             "approved_for_report_rendering": approved,
             "coverage": coverage,
+            "grounding_level": "traceable",
         }])
         return {"gates": len(results), "blocking_failures": blocking_failures,
                 "warnings": warnings, "approved": approved}
