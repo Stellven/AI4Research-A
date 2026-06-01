@@ -32,6 +32,8 @@ class SourceContainerLoadOperator(Operator):
 
     def run(self, ctx: RunContext, work: WorkStore, pipeline: list[Operator]) -> dict:
         containers = _read_input_containers(ctx)
+        contract = (work.read_rows("research_contracts") or [{}])[0]
+        allowed = set(contract.get("source_policy", {}).get("allowed_source_pack_types") or [])
         seen: set[str] = set()
         rows = []
         for i, c in enumerate(containers):
@@ -42,6 +44,8 @@ class SourceContainerLoadOperator(Operator):
             spt = c["source_pack_type"]
             if spt not in SOURCE_PACK_MAP:
                 raise ValueError(f"unsupported source_pack_type: {spt}")
+            if allowed and spt not in allowed:
+                raise ValueError(f"source_pack_type not allowed by contract: {spt}")
             rows.append({
                 "container_id": f"{ctx.run_id}.{cid}",
                 "run_id": ctx.run_id,
@@ -62,17 +66,33 @@ class SourceItemSelectOperator(Operator):
 
     def run(self, ctx: RunContext, work: WorkStore, pipeline: list[Operator]) -> dict:
         containers = _read_input_containers(ctx)
+        contract = (work.read_rows("research_contracts") or [{}])[0]
+        cap = contract.get("source_policy", {}).get("max_items_per_container")
+        cap = None if cap is None else int(cap)
         rows = []
         seen: set[str] = set()
-        rank = 0
+        supplied_items = 0
         for c in containers:
             source_family, adapter_id, _ = SOURCE_PACK_MAP[c["source_pack_type"]]
             container_id = f"{ctx.run_id}.{c['container_id']}"
-            for item in c.get("items", []):
+            indexed_items = list(enumerate(c.get("items", [])))
+            supplied_items += len(indexed_items)
+            for _, item in indexed_items:
                 sid = f"{ctx.run_id}.{item['item_id']}"
                 if sid in seen:
                     raise ValueError(f"duplicate item_id: {item['item_id']}")
                 seen.add(sid)
+            if cap is not None and len(indexed_items) > cap:
+                dated = [(idx, item) for idx, item in indexed_items if item.get("published_at")]
+                undated = [(idx, item) for idx, item in indexed_items if not item.get("published_at")]
+                dated_sorted = sorted(dated, key=lambda pair: pair[1]["published_at"], reverse=True)
+                selected = (dated_sorted + undated)[:cap]
+                selection_reason = f"freshness_top_{cap}"
+            else:
+                selected = indexed_items
+                selection_reason = "include_all"
+            for original_index, item in selected:
+                sid = f"{ctx.run_id}.{item['item_id']}"
                 rows.append({
                     "selected_item_id": sid,
                     "run_id": ctx.run_id,
@@ -84,14 +104,13 @@ class SourceItemSelectOperator(Operator):
                     "creator": item.get("creator"),
                     "published_at": item.get("published_at"),
                     "accessed_at": ids.utc_now_iso(),
-                    "source_rank": rank,
-                    "selection_reason": "Phase 0 include_all policy",
+                    "source_rank": original_index,
+                    "selection_reason": selection_reason,
                     "acquisition_status": "pending",
                     "provider_metadata": item.get("provider_metadata"),
                 })
-                rank += 1
         work.write_rows("selected_source_items", rows)
-        return {"selected_items": len(rows)}
+        return {"supplied_items": supplied_items, "selected_items": len(rows)}
 
 
 class DocumentAcquisitionOperator(Operator):
@@ -105,17 +124,20 @@ class DocumentAcquisitionOperator(Operator):
         succeeded = failed = docs = 0
         for i, item in enumerate(items):
             attempt_id = ids.mint(ctx.run_id, "DAA", i)
-            adapter = get_adapter(item["adapter_id"])
-            if adapter is None:
-                ok, fcode, fmsg, res = False, "adapter_not_available", \
-                    f"no adapter '{item['adapter_id']}' in Phase 0", None
-            else:
-                vok, vreason = adapter.validate_item(item)
-                if not vok:
-                    ok, fcode, fmsg, res = False, "invalid_item", vreason, None
+            try:
+                adapter = get_adapter(item["adapter_id"])
+                if adapter is None:
+                    ok, fcode, fmsg, res = False, "adapter_not_available", \
+                        f"no adapter '{item['adapter_id']}' in Phase 0", None
                 else:
-                    res = adapter.acquire(item)
-                    ok, fcode, fmsg = res.ok, res.failure_code, res.failure_message
+                    vok, vreason = adapter.validate_item(item)
+                    if not vok:
+                        ok, fcode, fmsg, res = False, "invalid_item", vreason, None
+                    else:
+                        res = adapter.acquire(item)
+                        ok, fcode, fmsg = res.ok, res.failure_code, res.failure_message
+            except Exception as exc:  # noqa: BLE001 - one bad item must not abort the batch
+                ok, fcode, fmsg, res = False, "acquisition_error", f"{type(exc).__name__}: {exc}", None
             attempts.append({
                 "attempt_id": attempt_id,
                 "run_id": ctx.run_id,

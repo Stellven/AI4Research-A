@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 
+from ..adapters import SOURCE_PACK_MAP
 from .. import ids
 from ..runtime import RunContext
 from ..workfiles import WorkStore
@@ -11,6 +12,13 @@ from .base import Operator, plan_rows, spec_rows, validate_plan
 
 def _read_topic(ctx: RunContext) -> str:
     return json.loads((ctx.input_dir / "topic.json").read_text(encoding="utf-8"))["topic"]
+
+
+def _read_run_config(ctx: RunContext) -> dict:
+    path = ctx.input_dir / "run_config.json"
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 class RunInitializeOperator(Operator):
@@ -41,6 +49,15 @@ class ResearchContractOperator(Operator):
         topic = _read_topic(ctx)
         if not topic.strip():
             raise ValueError("topic must be non-empty")
+        run_config = _read_run_config(ctx)
+        source_policy = {
+            "allowed_source_pack_types": list(SOURCE_PACK_MAP),
+            "allowed_source_adapters": [adapter_id for _, adapter_id, _ in SOURCE_PACK_MAP.values()],
+            "minimum_source_count": int(run_config.get("minimum_source_count", 1)),
+            "expected_source_count": None,
+            "exact_source_list_required": True,
+            "max_items_per_container": run_config.get("max_items_per_container"),
+        }
         work.write_rows("research_contracts", [{
             "contract_id": ids.mint(ctx.run_id, "RC", 0),
             "run_id": ctx.run_id,
@@ -49,13 +66,7 @@ class ResearchContractOperator(Operator):
             "audience": None,
             "freshness_required": 0,
             "freshness_window_days": None,
-            "source_policy": {
-                "allowed_source_pack_types": ["local_document_set", "youtube_channel", "github_repo"],
-                "allowed_source_adapters": ["local_document_file", "youtube_transcript_fixture", "github_file_fixture"],
-                "minimum_source_count": 1,
-                "expected_source_count": None,
-                "exact_source_list_required": True,
-            },
+            "source_policy": source_policy,
             "required_dimensions": [
                 "what the provided sources say",
                 "evidence-backed claims",

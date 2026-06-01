@@ -10,6 +10,7 @@ before `PersistRunToStore`; SQLite re-confirms references at load.
 from __future__ import annotations
 
 from .. import ids
+from ..adapters import SOURCE_PACK_MAP
 from ..runtime import RunContext
 from ..workfiles import WorkStore
 from .base import Operator
@@ -45,20 +46,39 @@ _ALLOWED_LOCATOR_KEYS = {"url", "local_path", "local_fixture_path", "inline_text
 _PROVIDER_KEY_FRAGMENTS = ("youtube", "github", "video_id", "channel", "timestamp_url",
                            "watch_url", "repo", "sha", "stars", "handle", "transcript")
 
-_ENUMS = {
+def _enums() -> dict[tuple[str, str], set[str]]:
+    return {
     ("runs", "status"): {"initialized", "running", "finalized", "diagnostic_only", "failed"},
     ("acquisition_attempts", "status"): {"succeeded", "failed", "skipped"},
-    ("source_containers", "source_pack_type"): {"local_document_set", "youtube_channel", "github_repo"},
-    ("documents", "document_kind"): {"youtube_transcript", "github_document", "local_document"},
+    ("source_containers", "source_pack_type"): set(SOURCE_PACK_MAP),
+    ("documents", "document_kind"): {doc_kind for _, _, doc_kind in SOURCE_PACK_MAP.values()},
     ("evidence", "evidence_type"): {"definition", "source_statement", "example", "risk",
                                     "recommendation", "limitation", "unknown"},
     ("claims", "claim_type"): {"definition", "technical_fact", "risk_claim", "recommendation_claim"},
     ("claims", "status"): {"draft", "accepted", "qualified", "rejected"},
     ("claims", "criticality"): {"normal", "critical"},
     ("claim_evidence", "role"): {"supporting", "contradicting", "qualifying"},
-}
+    }
 _REQUIRED_TABLES = ["runs", "research_contracts", "question_graph_nodes",
                     "physical_plan_nodes", "source_containers", "selected_source_items"]
+_REQUIRED_COLUMNS = {
+    "runs": ["run_id", "topic", "status"],
+    "selected_source_items": ["selected_item_id", "container_id", "source_family", "adapter_id"],
+    "documents": ["document_id", "selected_item_id", "content_hash"],
+    "spans": ["span_id", "document_id", "start_char", "end_char", "text"],
+    "evidence": ["evidence_id", "span_id", "summary", "quoted_text"],
+    "claims": ["claim_id", "claim_type", "status"],
+    "citations": ["citation_id", "evidence_id", "label"],
+}
+_PRIMARY_KEYS = {
+    "runs": ["run_id"],
+    "selected_source_items": ["selected_item_id"],
+    "documents": ["document_id"],
+    "spans": ["span_id"],
+    "evidence": ["evidence_id"],
+    "claims": ["claim_id"],
+    "citations": ["citation_id"],
+}
 
 
 def _result(gate_id, status, severity, checked, issues, metrics=None):
@@ -82,7 +102,22 @@ def gate_required_rows(s, contract):
 
 def gate_schema_validation(s, contract):
     issues = []
-    for (table, col), allowed in _ENUMS.items():
+    enums = _enums()
+    for table, cols in _REQUIRED_COLUMNS.items():
+        for row in s.get(table, []):
+            for col in cols:
+                if col not in row or row[col] is None:
+                    issues.append(f"{table}.{col} is required")
+    for table, cols in _PRIMARY_KEYS.items():
+        seen = set()
+        for row in s.get(table, []):
+            key = tuple(row.get(col) for col in cols)
+            if any(value is None for value in key):
+                continue
+            if key in seen:
+                issues.append(f"{table} duplicate primary key {key}")
+            seen.add(key)
+    for (table, col), allowed in enums.items():
         for row in s.get(table, []):
             if col in row and row[col] not in allowed:
                 issues.append(f"{table}.{col}={row[col]!r} not in {sorted(allowed)}")
@@ -94,7 +129,7 @@ def gate_schema_validation(s, contract):
         if not (ev.get("summary") or "").strip() or not (ev.get("quoted_text") or "").strip():
             issues.append(f"evidence {ev.get('evidence_id')} missing summary/quoted_text")
     status, sev = (HARD_FAIL, BLOCKING) if issues else (PASS, BLOCKING)
-    checked = sorted({t for (t, _) in _ENUMS} | {"spans", "evidence"})
+    checked = sorted({t for (t, _) in enums} | set(_REQUIRED_COLUMNS) | set(_PRIMARY_KEYS) | {"spans", "evidence"})
     return _result("SchemaValidationGate", status, sev, checked, issues)
 
 
@@ -202,12 +237,16 @@ def gate_citation_resolution(s, contract):
     spans = {sp["span_id"] for sp in s.get("spans", [])}
     docs = {d["document_id"] for d in s.get("documents", [])}
     items = {i["selected_item_id"] for i in s["selected_source_items"]}
-    evidence = {e["evidence_id"] for e in s.get("evidence", [])}
+    evidence = {e["evidence_id"]: e for e in s.get("evidence", [])}
     issues = []
     for c in s.get("citations", []):
-        if not (c["evidence_id"] in evidence and c["span_id"] in spans
+        ev = evidence.get(c["evidence_id"])
+        if not (ev is not None and c["span_id"] in spans
                 and c["document_id"] in docs and c["selected_item_id"] in items):
             issues.append(f"citation {c['citation_id']} path does not resolve")
+        elif (c["span_id"], c["document_id"], c["selected_item_id"]) != (
+                ev["span_id"], ev["document_id"], ev["selected_item_id"]):
+            issues.append(f"citation {c['citation_id']} path inconsistent with its evidence")
     status, sev = (HARD_FAIL, BLOCKING) if issues else (PASS, BLOCKING)
     return _result("CitationResolutionGate", status, sev, ["citations"], issues)
 
@@ -236,6 +275,9 @@ def gate_source_coverage(s, contract):
     if len(containers) < minimum:
         return _result("SourceCoverageGate", HARD_FAIL, BLOCKING, ["source_containers"],
                        [f"{len(containers)} sources < minimum_source_count {minimum}"], metrics)
+    if len(items) > 0 and acquired == 0:
+        return _result("SourceCoverageGate", HARD_FAIL, BLOCKING, ["source_containers"],
+                       ["items supplied but zero documents acquired"], metrics)
     return _ok("SourceCoverageGate", BLOCKING, ["source_containers"], metrics)
 
 

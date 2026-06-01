@@ -12,5 +12,11 @@ ai4research = "ai4research.cli:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build]
+exclude = [
+  "**/__pycache__",
+  "**/*.pyc",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["ai4research"]

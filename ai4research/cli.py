@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import sys
 from pathlib import Path
 
@@ -14,6 +13,27 @@ from .finalize import FinalizeResult, finalize
 from .operators import OperatorRunner, RunFailed, build_pipeline
 from .runtime import RunContext
 from .workfiles import WorkStore
+
+
+def stage_source_pack(pack_path: Path, dest: Path) -> None:
+    rows = []
+    pack_dir = pack_path.parent
+    for line in pack_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        row = json.loads(line)
+        for item in row.get("items", []):
+            loc = item.get("item_locator")
+            if not isinstance(loc, dict):
+                continue
+            for key in ("local_path", "local_fixture_path"):
+                value = loc.get(key)
+                if value:
+                    path = Path(value)
+                    loc[key] = str(path if path.is_absolute() else pack_dir / path)
+        rows.append(row)
+    dest.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in rows), encoding="utf-8")
 
 
 def cmd_demo(args: argparse.Namespace) -> int:
@@ -25,7 +45,11 @@ def cmd_demo(args: argparse.Namespace) -> int:
     (ctx.input_dir / "topic.json").write_text(
         json.dumps({"topic": args.topic}, indent=2), encoding="utf-8"
     )
-    shutil.copyfile(Path(args.source_pack).resolve(), ctx.input_dir / "source_containers.jsonl")
+    if args.max_per_container is not None:
+        (ctx.input_dir / "run_config.json").write_text(
+            json.dumps({"max_items_per_container": args.max_per_container}, indent=2), encoding="utf-8"
+        )
+    stage_source_pack(Path(args.source_pack).resolve(), ctx.input_dir / "source_containers.jsonl")
 
     work = WorkStore(ctx)
     rc = 0
@@ -63,6 +87,7 @@ def main(argv: list[str] | None = None) -> int:
     demo.add_argument("--topic", required=True)
     demo.add_argument("--source-pack", required=True, help="path to a source_containers.jsonl")
     demo.add_argument("--runs-dir", default="runs")
+    demo.add_argument("--max-per-container", type=int, default=None)
     demo.set_defaults(func=cmd_demo)
 
     args = parser.parse_args(argv)

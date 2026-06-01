@@ -45,8 +45,12 @@ def finalize(ctx: RunContext, work: WorkStore) -> FinalizeResult:
     except sqlite3.Error as exc:  # any load failure (FK, NOT NULL, schema) fails closed
         persisted, persist_error = False, str(exc)
 
+    relabeled = False
+    if not persisted and approved:
+        relabeled = _relabel_final_report_as_diagnostic(ctx, work)
+
     # F FinalCloseoutGate — decide the terminal status from persist + exports.
-    report_name = "final_report.md" if approved else "diagnostic_report.md"
+    report_name = "diagnostic_report.md" if relabeled else ("final_report.md" if approved else "diagnostic_report.md")
     report_path = ctx.exports_dir / report_name
     html_path = ctx.exports_dir / report_name.replace(".md", ".html")
     exports_ok = report_path.exists() and report_path.stat().st_size > 0 and html_path.exists()
@@ -104,6 +108,29 @@ def _set_run_status(work: WorkStore, status: str) -> None:
         runs[0]["status"] = status
         runs[0]["completed_at"] = ids.utc_now_iso()
         work.write_rows("runs", runs)
+
+
+def _relabel_final_report_as_diagnostic(ctx: RunContext, work: WorkStore) -> bool:
+    changed = False
+    renames = [
+        ("final_report.md", "diagnostic_report.md", "diagnostic_report"),
+        ("final_report.html", "diagnostic_report.html", "html_report"),
+    ]
+    exports = work.read_rows("artifact_exports")
+    for source_name, target_name, kind in renames:
+        source = ctx.exports_dir / source_name
+        target = ctx.exports_dir / target_name
+        if source.exists() and not target.exists():
+            source.rename(target)
+            changed = True
+        for row in exports:
+            if row.get("path") == f"exports/{source_name}" and target.exists():
+                row["path"] = f"exports/{target_name}"
+                row["kind"] = kind
+                changed = True
+    if changed:
+        work.write_rows("artifact_exports", exports)
+    return changed
 
 
 def _build_bundle(ctx: RunContext, work: WorkStore, status: str):

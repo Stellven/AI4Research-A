@@ -30,7 +30,14 @@ def acquire_text(item: dict, *, path_key: str, document_kind: str) -> AcquireRes
         if not path.exists():
             return AcquireResult(False, failure_code="local_fixture_missing",
                                  failure_message=f"file not found: {path}")
-        text, title = path.read_text(encoding="utf-8"), (item.get("title") or path.name)
+        if not path.is_file():
+            return AcquireResult(False, failure_code="not_a_file",
+                                 failure_message=f"path is not a file: {path}")
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            return AcquireResult(False, failure_code="read_error", failure_message=str(exc))
+        title = item.get("title") or path.name
     else:
         return AcquireResult(False, failure_code="invalid_locator",
                              failure_message=f"item_locator needs {path_key} or inline_text")

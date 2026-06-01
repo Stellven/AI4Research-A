@@ -11,16 +11,25 @@ from .base import Operator, RunFailed
 
 
 class OperatorRunner:
-    def __init__(self, pipeline: list[Operator]):
+    def __init__(self, pipeline: list[Operator], plan: list[str] | None = None):
         self.pipeline = pipeline
+        self.registry = {op.NAME: op for op in pipeline}
+        if len(self.registry) != len(pipeline):
+            raise ValueError("operator names must be unique")
+        self.plan = plan or [op.NAME for op in pipeline]
+        missing = [name for name in self.plan if name not in self.registry]
+        if missing:
+            raise ValueError(f"plan references unknown operator(s): {missing}")
+        self.planned_pipeline = [self.registry[name] for name in self.plan]
 
     def run(self, ctx: RunContext, work: WorkStore) -> list[dict]:
         invocations: list[dict] = []
-        for idx, op in enumerate(self.pipeline):
+        for idx, name in enumerate(self.plan):
+            op = self.registry[name]
             started = ids.utc_now_iso()
             status, error, metrics = "success", None, {}
             try:
-                metrics = op.run(ctx, work, self.pipeline) or {}
+                metrics = op.run(ctx, work, self.planned_pipeline) or {}
             except Exception as exc:  # noqa: BLE001 - record any operator failure
                 status, error = "failed", f"{type(exc).__name__}: {exc}"
             inv = {
