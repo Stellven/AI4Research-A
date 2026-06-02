@@ -381,5 +381,35 @@ class YtDlpListerTest(unittest.TestCase):
         self.assertEqual([v.video_id for v in vids], ["new"])           # 'old' (2024) excluded by since
 
 
+class ResearchWrapperTest(unittest.TestCase):
+    """The single-command wrapper chains fetch -> compile (#13). Both stages are mocked."""
+
+    def test_chains_fetch_then_compile(self):
+        from ai4research import research
+        calls = {}
+        with mock.patch("ai4research.fetch.cli.main", lambda argv: calls.setdefault("fetch", argv) and 0 or 0), \
+             mock.patch("ai4research.cli.main", lambda argv: calls.setdefault("demo", argv) and 0 or 0), \
+             tempfile.TemporaryDirectory() as tmp:
+            rc = research.main(["my topic", "--out", tmp, "--model-runtime", "stub", "--copy-to", tmp])
+        self.assertEqual(rc, 0)
+        self.assertIn("--query", calls["fetch"])
+        self.assertIn("my topic", calls["fetch"])
+        self.assertNotIn("--model-runtime", calls["fetch"])      # stub -> heuristic planner, no codex flag
+        self.assertEqual(calls["demo"][0], "demo")
+        self.assertIn("--copy-to", calls["demo"])
+        sp = calls["demo"][calls["demo"].index("--source-pack") + 1]
+        self.assertTrue(sp.endswith("snap/source_containers.jsonl"))
+
+    def test_aborts_when_fetch_fails(self):
+        from ai4research import research
+        demo_called = []
+        with mock.patch("ai4research.fetch.cli.main", lambda argv: 2), \
+             mock.patch("ai4research.cli.main", lambda argv: demo_called.append(argv) or 0), \
+             tempfile.TemporaryDirectory() as tmp:
+            rc = research.main(["t", "--out", tmp])
+        self.assertEqual(rc, 2)                                  # fetch's exit code propagates
+        self.assertEqual(demo_called, [])                        # compile never reached
+
+
 if __name__ == "__main__":
     unittest.main()

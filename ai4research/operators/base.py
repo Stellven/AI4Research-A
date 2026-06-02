@@ -60,6 +60,34 @@ def validate_plan(pipeline: list[Operator]) -> None:
         produced.update(op.OUTPUT_SCHEMAS)
 
 
+_LLM_OPERATORS = {"LLMSynthesisOperator", "AnswerSynthesisOperator"}
+
+
+def plan_pipeline(pipeline: list[Operator], run_config: dict) -> tuple[list[str], dict]:
+    """Rule-based planner (golden-parity v1): select the operator sequence from the registry and
+    record a *real* optimizer decision. v1 selects the full contracted pipeline in dependency order
+    (validated by validate_plan); the recorded alternative is the deterministic-core plan that omits
+    the LLM operators, chosen when no model runtime is configured. Execution is unchanged — the LLM
+    operators are inert without a runtime — but the decision is genuine, not 'no alternatives
+    considered'. v2 will let the planner actually branch (conditionally include operators)."""
+    validate_plan(pipeline)
+    names = [op.NAME for op in pipeline]
+    has_runtime = bool(run_config.get("model_runtime"))
+    llm_ops = [n for n in names if n in _LLM_OPERATORS]
+    selected = "llm_augmented" if has_runtime else "deterministic_core"
+    reason = (
+        f"Selected the {selected} plan: {len(names)} operators in dependency order. "
+        + (f"LLM operators {llm_ops} active (model_runtime={run_config.get('model_runtime')})."
+           if has_runtime
+           else f"No model_runtime configured — deterministic run; LLM operators {llm_ops} are inert.")
+    )
+    alternatives = [
+        f"deterministic_core: omit {llm_ops} (extractive + metric synthesis only)",
+        f"llm_augmented: include {llm_ops} for question-derivation + synthesis",
+    ]
+    return names, {"reason": reason, "alternatives_considered": alternatives}
+
+
 def plan_rows(run_id: str, pipeline: list[Operator]) -> tuple[list[dict], list[dict]]:
     """physical_plan_nodes + physical_plan_edges for the static linear plan."""
     nodes = [

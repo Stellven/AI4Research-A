@@ -217,5 +217,19 @@ class GateTest(unittest.TestCase):
             self.assertEqual([row["operator_name"] for row in work.read_rows("operator_invocations")], plan)
 
 
+class PlanPipelineTest(unittest.TestCase):
+    """#25: the planner selects from the registry and records a real decision (golden parity)."""
+
+    def test_records_real_decision(self):
+        from ai4research.operators.base import plan_pipeline
+        pipe = build_pipeline()
+        names, dec = plan_pipeline(pipe, {"model_runtime": "codex"})
+        self.assertEqual(names, [op.NAME for op in pipe])     # v1: full pipeline, dependency order
+        self.assertTrue(dec["alternatives_considered"])       # a real alternative, not []
+        self.assertIn("llm_augmented", dec["reason"])
+        _, det = plan_pipeline(pipe, {})
+        self.assertIn("deterministic_core", det["reason"])    # no runtime -> deterministic plan
+
+
 if __name__ == "__main__":
     unittest.main()

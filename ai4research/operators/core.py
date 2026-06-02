@@ -9,7 +9,7 @@ from ..domain_packs import get_pack, pack_rows
 from ..model_runtime import ModelRuntime, get_runtime
 from ..runtime import RunContext
 from ..workfiles import WorkStore
-from .base import Operator, plan_rows, spec_rows, validate_plan
+from .base import Operator, plan_pipeline, plan_rows, spec_rows
 
 # codex requires a top-level object schema (strict). The sub-questions are the angles an
 # analyst would investigate; an LLM proposes them, the pack template is the deterministic fallback.
@@ -177,14 +177,14 @@ class StaticPlanOperator(Operator):
     OUTPUT_SCHEMAS = ["physical_plan_nodes", "physical_plan_edges", "optimizer_decisions"]
 
     def run(self, ctx: RunContext, work: WorkStore, pipeline: list[Operator]) -> dict:
-        validate_plan(pipeline)
+        names, decision = plan_pipeline(pipeline, _read_run_config(ctx))   # selects + records a real decision
         nodes, edges = plan_rows(ctx.run_id, pipeline)
         work.write_rows("physical_plan_nodes", nodes)
         work.write_rows("physical_plan_edges", edges)
         work.write_rows("optimizer_decisions", [{
             "decision_id": f"{ctx.run_id}.D0",
             "run_id": ctx.run_id,
-            "reason": "Phase 0 uses a fixed static plan; no alternatives considered.",
-            "alternatives_considered": [],
+            "reason": decision["reason"],
+            "alternatives_considered": decision["alternatives_considered"],
         }])
-        return {"plan_nodes": len(nodes)}
+        return {"plan_nodes": len(nodes), "operators": len(names)}

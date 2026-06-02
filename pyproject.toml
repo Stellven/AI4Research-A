@@ -12,6 +12,7 @@ fetch = ["yt-dlp", "youtube-transcript-api", "requests"]
 [project.scripts]
 ai4research = "ai4research.cli:main"
 ai4research-fetch = "ai4research.fetch.cli:main"
+ai4research-research = "ai4research.research:main"
 
 [build-system]
 requires = ["hatchling"]
