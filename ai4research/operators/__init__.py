@@ -43,7 +43,7 @@ def build_pipeline(model_runtime=None) -> list[Operator]:
     return [
         RunInitializeOperator(),
         ResearchContractOperator(),
-        QuestionGraphStubOperator(),
+        QuestionGraphStubOperator(model_runtime),
         StaticPlanOperator(),
         SourceContainerLoadOperator(),
         SourceItemSelectOperator(),

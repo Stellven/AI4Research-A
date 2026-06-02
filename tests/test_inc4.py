@@ -224,5 +224,31 @@ class AnswerSynthesisTest(unittest.TestCase):
             self.assertEqual(gate["status"], "warning")                   # something was dropped
 
 
+class QuestionGraphDerivationTest(unittest.TestCase):
+    """#18: sub-questions are derived from the topic when a runtime is present, else fall back
+    to the pack template (deterministic). Prompt-keyed StubRuntime — no network."""
+
+    def test_sub_questions_derived_from_topic(self):
+        def stub(prompt):
+            if "Decompose this research topic" in prompt:
+                return [{"sub_questions": ["Who is adopting it?", "What are the benchmarks?",
+                                           "What criticisms exist?"]}]
+            return []   # LLMSynthesis / AnswerSynthesis prompts stay silent
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx, work, _ = _run_with_stub(tmp, stub)
+            subs = [n["text"] for n in work.read_rows("question_graph_nodes") if n["type"] == "sub_question"]
+            self.assertIn("Who is adopting it?", subs)
+            self.assertNotIn("Which repositories are most active?", subs)   # template was replaced
+
+    def test_falls_back_to_template_without_runtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx, work = support.stage(tmp, support.PROVING_TOPIC, [support.local_container()])
+            _write_run_config(ctx, {"domain_pack": "youtube_github_research"})
+            OperatorRunner(build_pipeline()).run(ctx, work)   # no runtime injected
+            subs = [n["text"] for n in work.read_rows("question_graph_nodes") if n["type"] == "sub_question"]
+            self.assertIn("Which repositories are most active?", subs)   # the pack template
+
+
 if __name__ == "__main__":
     unittest.main()

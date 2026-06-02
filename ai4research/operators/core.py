@@ -6,9 +6,48 @@ import json
 from .. import ids
 from ..adapters import SOURCE_PACK_MAP
 from ..domain_packs import get_pack, pack_rows
+from ..model_runtime import ModelRuntime, get_runtime
 from ..runtime import RunContext
 from ..workfiles import WorkStore
 from .base import Operator, plan_rows, spec_rows, validate_plan
+
+# codex requires a top-level object schema (strict). The sub-questions are the angles an
+# analyst would investigate; an LLM proposes them, the pack template is the deterministic fallback.
+QUESTION_SCHEMA = {
+    "type": "object", "additionalProperties": False, "required": ["sub_questions"],
+    "properties": {"sub_questions": {"type": "array", "items": {"type": "string"}}},
+}
+
+
+def _question_prompt(topic: str) -> str:
+    return (
+        "Decompose this research topic into the distinct angles a good analyst would investigate "
+        "to answer it well — different perspectives such as what it is / latest developments, "
+        "adoption and who is using it, evidence and results, criticisms and limitations, "
+        "alternatives — but only those the topic actually warrants. Return 3-6 concise, "
+        'non-overlapping sub-questions as JSON {"sub_questions": ["...", ...]}.\n\n'
+        f"Topic: {topic}"
+    )
+
+
+def _derive_sub_questions(topic: str, runtime, fallback: list[str]) -> list[str]:
+    """LLM-proposed angle sub-questions for the topic; deterministic fallback to the pack
+    template on no runtime / failure / empty. Dedup + cap; code validates the model's output."""
+    if runtime is None:
+        return fallback
+    try:
+        records = runtime.propose(_question_prompt(topic), QUESTION_SCHEMA)
+    except Exception:  # noqa: BLE001 - best-effort; fall back to the template
+        return fallback
+    if not records:
+        return fallback
+    seen, out = set(), []
+    for q in records[0].get("sub_questions") or []:
+        q = str(q).strip()
+        if q and q.lower() not in seen:
+            seen.add(q.lower())
+            out.append(q)
+    return out[:6] or fallback
 
 
 def _read_topic(ctx: RunContext) -> str:
@@ -89,44 +128,47 @@ class ResearchContractOperator(Operator):
 
 
 class QuestionGraphStubOperator(Operator):
+    """Build the question graph: a root question (the topic) decomposed into sub-question angles.
+    When a live runtime is selected the angles are derived from the topic; otherwise they fall
+    back to the domain pack's fixed template (so the default run stays deterministic). A pack with
+    no sub-question template (generic) keeps a single root."""
+
     NAME = "QuestionGraphStubOperator"
     INPUT_SCHEMAS = ["research_contracts"]
     OUTPUT_SCHEMAS = ["question_graph_nodes"]
+
+    def __init__(self, runtime: "ModelRuntime | None" = None):
+        self.runtime = runtime
 
     def run(self, ctx: RunContext, work: WorkStore, pipeline: list[Operator]) -> dict:
         topic = _read_topic(ctx)
         contract = (work.read_rows("research_contracts") or [{}])[0]
         pack = get_pack(contract.get("domain_pack_id"))
-        nodes = []
-        edges = []
-        root_node_id = None
-        for entry in pack["question_template"]:
-            qid = entry["id"]
-            node_id = f"{ctx.run_id}.{qid}"
-            if entry["type"] == "root_question":
-                root_node_id = node_id
-                text_value = topic
-            else:
-                text_value = entry["text"]
-            nodes.append({
-                "node_id": node_id,
-                "run_id": ctx.run_id,
-                "type": entry["type"],
-                "text": text_value,
-                "status": "open",
-            })
-        if root_node_id:
-            for node in nodes:
-                if node["type"] == "sub_question":
-                    edges.append({
-                        "run_id": ctx.run_id,
-                        "from_node": root_node_id,
-                        "to_node": node["node_id"],
-                        "type": "decomposes_to",
-                    })
+        template_subs = [e["text"] for e in pack["question_template"] if e["type"] == "sub_question"]
+
+        run_config = _read_run_config(ctx)
+        runtime = self.runtime or (get_runtime(run_config["model_runtime"]) if run_config.get("model_runtime") else None)
+        # only packs that decompose at all (have a sub-question template) get topic-derived angles;
+        # generic keeps a single root question.
+        sub_questions = _derive_sub_questions(topic, runtime, template_subs) if template_subs else []
+
+        root_entry = next((e for e in pack["question_template"] if e["type"] == "root_question"), None)
+        nodes, edges, root_id = [], [], None
+        if root_entry:
+            root_id = f"{ctx.run_id}.{root_entry['id']}"
+            nodes.append({"node_id": root_id, "run_id": ctx.run_id, "type": "root_question",
+                          "text": topic, "status": "open"})
+        for i, text_value in enumerate(sub_questions, start=1):
+            node_id = f"{ctx.run_id}.Q{i}"
+            nodes.append({"node_id": node_id, "run_id": ctx.run_id, "type": "sub_question",
+                          "text": text_value, "status": "open"})
+            if root_id:
+                edges.append({"run_id": ctx.run_id, "from_node": root_id,
+                              "to_node": node_id, "type": "decomposes_to"})
         work.write_rows("question_graph_nodes", nodes)
         work.write_rows("question_graph_edges", edges)
-        return {"nodes": len(nodes), "edges": len(edges)}
+        return {"nodes": len(nodes), "edges": len(edges),
+                "derived": int(bool(runtime) and sub_questions != template_subs)}
 
 
 class StaticPlanOperator(Operator):
