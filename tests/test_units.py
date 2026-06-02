@@ -11,7 +11,7 @@ from ai4research.operators import OperatorRunner, build_pipeline
 from ai4research.operators import RunFailed
 from ai4research.operators import gates as G
 from ai4research.operators.base import Operator, validate_plan
-from ai4research.operators.extraction import _classify
+from ai4research.operators.extraction import _citation_url, _classify
 from tests import support
 
 _TABLES = ["runs", "research_contracts", "question_graph_nodes", "physical_plan_nodes",
@@ -24,6 +24,21 @@ def snap(**over) -> dict:
     s = {t: [] for t in _TABLES}
     s.update(over)
     return s
+
+
+class CitationUrlTest(unittest.TestCase):
+    """The youtube timestamp deep link must use the right query separator (#16)."""
+
+    def test_youtube_timestamp_separator(self):
+        doc = {"document_kind": "youtube_transcript",
+               "provider_metadata": {"segments": [{"start_char": 0, "start_seconds": 42}]}}
+        span = {"start_char": 0, "end_char": 10}
+        # a watch?v=… URL already has '?', so the timestamp joins with '&'
+        self.assertEqual(_citation_url({"url": "https://www.youtube.com/watch?v=ID"}, doc, span),
+                         "https://www.youtube.com/watch?v=ID&t=42s")
+        # a youtu.be/… URL has no '?', so it must join with '?' (not a malformed '&t=')
+        self.assertEqual(_citation_url({"url": "https://youtu.be/ID"}, doc, span),
+                         "https://youtu.be/ID?t=42s")
 
 
 class OperatorValidationTest(unittest.TestCase):

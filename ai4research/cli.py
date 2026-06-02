@@ -114,7 +114,8 @@ def _print_summary(ctx: RunContext, result: FinalizeResult, work: WorkStore) -> 
     citations = [c for c in work.read_rows("citations") if c.get("url")]
     gates = work.read_rows("gate_results")
     topic = (work.read_rows("runs") or [{}])[0].get("topic")
-    accepted = sum(1 for c in claims if c.get("status") == "accepted")
+    answer = work.read_rows("answer")
+    findings = len(answer[0].get("key_findings") or []) if answer else 0
     yt = sum(1 for c in citations if "&t=" in c["url"])
     gh = sum(1 for c in citations if "#L" in c["url"])
     gp = sum(1 for g in gates if g.get("status") == "pass")
@@ -136,8 +137,9 @@ def _print_summary(ctx: RunContext, result: FinalizeResult, work: WorkStore) -> 
     if result.persist_error:
         row("persist", s(result.persist_error, "red"))
     print()
-    row("sources", f"{len(docs)} documents{dot}{len(evidence)} evidence cards")
-    row("claims", f"{accepted} accepted{s(' / ', 'dim')}{len(claims)}")
+    row("findings", s(f"{findings} synthesized", "bold") if findings
+        else s("none — add --model-runtime codex to synthesize", "dim"))
+    row("sources", f"{len(docs)} documents{dot}{len(evidence)} evidence cards{dot}{len(claims)} claims")
     deeplinks = f"{len(citations)} deep links"
     if citations:
         deeplinks += "   " + f"{s.glyph('youtube')} {yt} youtube{dot}{s.glyph('github')} {gh} github"

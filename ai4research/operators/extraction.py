@@ -517,7 +517,8 @@ def _citation_url(locator: dict, doc: dict, span: dict) -> str | None:
     if doc.get("document_kind") == "youtube_transcript":
         seconds = _youtube_seconds_for_span(doc.get("provider_metadata"), span["start_char"])
         if seconds is not None:
-            return f"{base_url}&t={seconds}s"
+            sep = "&" if "?" in base_url else "?"   # watch?v=… -> &t=; youtu.be/… -> ?t=
+            return f"{base_url}{sep}t={seconds}s"
     return base_url
 
 

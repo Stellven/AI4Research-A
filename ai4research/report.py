@@ -235,6 +235,10 @@ def build_view_model(d: ReportData) -> dict:
     yt = sum(1 for c in citations if "&t=" in c["url"])
     gh = sum(1 for c in citations if "#L" in c["url"])
     accepted = sum(1 for c in d.claims if c.get("status") == "accepted")
+    # "findings" are the synthesized, ranked key findings (Increment 5) — the report's headline.
+    # They are NOT the same as claims: claims include the 1:1 evidence-backed extractive claims
+    # (the ledger volume), so surfacing claim count as "findings" would overstate the result.
+    findings = len((d.answer[0].get("key_findings") or [])) if d.answer else 0
     gp = sum(1 for g in d.gate_results if g.get("status") == "pass")
     gw = sum(1 for g in d.gate_results if g.get("status") == "warning")
     gf = sum(1 for g in d.gate_results if g.get("status") in ("hard_fail", "repairable_fail"))
@@ -247,8 +251,8 @@ def build_view_model(d: ReportData) -> dict:
         "gate_status": "BLOCKED" if not d.approved else ("WARN" if gw else "PASS"),
         "metrics": {
             "documents": len(d.documents), "spans": len(d.spans), "evidence": len(d.evidence),
-            "claims": len(d.claims), "claims_accepted": accepted, "citations": len(citations),
-            "citations_youtube": yt, "citations_github": gh,
+            "findings": findings, "claims": len(d.claims), "claims_accepted": accepted,
+            "citations": len(citations), "citations_youtube": yt, "citations_github": gh,
             "gates_pass": gp, "gates_warn": gw, "gates_fail": gf, "gates_total": len(d.gate_results),
         },
     }
@@ -410,10 +414,10 @@ def _header_html(vm: dict) -> str:
 def _metric_band_html(vm: dict) -> str:
     m = vm["metrics"]
     cards = [
-        (m["documents"], "Documents", ""),
-        (m["spans"], "Spans", ""),
-        (m["evidence"], "Evidence", ""),
-        (m["claims_accepted"], "Claims", f"{m['claims_accepted']} of {m['claims']} accepted"),
+        # Findings (synthesized, the headline) are distinct from the claim/evidence ledger volume.
+        (m["findings"], "Findings", "synthesized" if m["findings"] else "no LLM synthesis"),
+        (m["documents"], "Documents", f"{m['spans']} spans"),
+        (m["evidence"], "Evidence", f"{m['claims']} claims (ledger)"),
         (m["citations"], "Deep Links", f"⏱ {m['citations_youtube']}  ·  # {m['citations_github']}"),
         (f"{m['gates_pass']}/{m['gates_total']}", "Gates Passed", f"{m['gates_warn']} warn · {m['gates_fail']} fail"),
     ]
