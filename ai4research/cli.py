@@ -12,6 +12,7 @@ from . import ids
 from .finalize import FinalizeResult, finalize
 from .operators import OperatorRunner, RunFailed, build_pipeline
 from .runtime import RunContext
+from .termstyle import Style
 from .workfiles import WorkStore
 
 
@@ -68,20 +69,65 @@ def cmd_demo(args: argparse.Namespace) -> int:
     result = finalize(ctx, work)
     if result.status == "failed":
         rc = 1
-    _print_summary(ctx, result)
+    _print_summary(ctx, result, work)
     return rc
 
 
-def _print_summary(ctx: RunContext, result: FinalizeResult) -> None:
-    print(f"run_id : {ctx.run_id}")
-    print(f"status : {result.status}")
-    print(f"report : {result.report_path or '(none)'}")
-    print(f"store  : {ctx.db_path if result.persisted else '(not persisted)'}")
+def _banner(s: Style) -> str:
+    title = "ai4research  ·  deterministic research compiler"
+    width = len(title) + 2
+    lines = ["╭" + "─" * width + "╮", "│ " + title + " │", "╰" + "─" * width + "╯"]
+    return "\n".join("  " + s(line, "cyan") for line in lines)
+
+
+def _print_summary(ctx: RunContext, result: FinalizeResult, work: WorkStore) -> None:
+    """A compact scorecard: terminal status, what the run produced, the provenance split
+    (youtube timestamps vs github line anchors), and the gate rollup — the auditable shape
+    of the report at a glance. Plain text when stdout is not a TTY (see termstyle)."""
+    s = Style()
+    docs = work.read_documents()
+    evidence = work.read_rows("evidence")
+    claims = work.read_rows("claims")
+    citations = [c for c in work.read_rows("citations") if c.get("url")]
+    gates = work.read_rows("gate_results")
+    topic = (work.read_rows("runs") or [{}])[0].get("topic")
+    accepted = sum(1 for c in claims if c.get("status") == "accepted")
+    yt = sum(1 for c in citations if "&t=" in c["url"])
+    gh = sum(1 for c in citations if "#L" in c["url"])
+    gp = sum(1 for g in gates if g.get("status") == "pass")
+    gw = sum(1 for g in gates if g.get("status") == "warning")
+    gf = sum(1 for g in gates if g.get("status") == "hard_fail")
+    color = {"finalized": "green", "diagnostic_only": "yellow", "failed": "red"}.get(result.status, "")
+    dot = s("  ·  ", "dim")
+
+    def row(label: str, value: str) -> None:
+        print(f"  {s(label.ljust(10), 'dim')}{value}")
+
+    if s.enabled:
+        print(_banner(s))
+    print()
+    row("run", ctx.run_id)
+    row("status", s(f"{s.glyph(result.status)} {result.status}", color, "bold"))
+    if topic:
+        row("topic", topic)
     if result.persist_error:
-        print(f"persist error: {result.persist_error}")
-    print("loaded :")
-    for table, n in result.counts.items():
-        print(f"  {table}: {n}")
+        row("persist", s(result.persist_error, "red"))
+    print()
+    row("sources", f"{len(docs)} documents{dot}{len(evidence)} evidence cards")
+    row("claims", f"{accepted} accepted{s(' / ', 'dim')}{len(claims)}")
+    deeplinks = f"{len(citations)} deep links"
+    if citations:
+        deeplinks += "   " + f"{s.glyph('youtube')} {yt} youtube{dot}{s.glyph('github')} {gh} github"
+    row("citations", deeplinks)
+    row("gates", dot.join([
+        s(f"{s.glyph('pass')} {gp} pass", "green"),
+        s(f"{s.glyph('warning')} {gw} warn", "yellow"),
+        s(f"{s.glyph('hard_fail')} {gf} fail", "red" if gf else "dim"),
+    ]))
+    print()
+    row("report", result.report_path or "(none)")
+    row("store", str(ctx.db_path) if result.persisted else "(not persisted)")
+    print()
 
 
 def main(argv: list[str] | None = None) -> int:

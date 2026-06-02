@@ -202,20 +202,148 @@ def render_markdown(d: ReportData) -> tuple[str, str]:
     return "\n".join([f"# {title}", ""] + body), kind
 
 
-def render_html(markdown: str, title: str) -> str:
-    """Minimal, dependency-free Markdown->HTML for headings, tables, lists, and quotes."""
-    lines = markdown.split("\n")
-    out, i = [], 0
+def build_view_model(d: ReportData) -> dict:
+    """The small data bundle the HTML header/metric-band/badge render from — derived purely
+    from gated artifacts (no new content). Mirrors the §14 HtmlReportViewModel idea."""
+    citations = [c for c in d.citations if c.get("url")]
+    yt = sum(1 for c in citations if "&t=" in c["url"])
+    gh = sum(1 for c in citations if "#L" in c["url"])
+    accepted = sum(1 for c in d.claims if c.get("status") == "accepted")
+    gp = sum(1 for g in d.gate_results if g.get("status") == "pass")
+    gw = sum(1 for g in d.gate_results if g.get("status") == "warning")
+    gf = sum(1 for g in d.gate_results if g.get("status") in ("hard_fail", "repairable_fail"))
+    return {
+        "heading": "Phase 0 Evidence Report" if d.approved else "Phase 0 Diagnostic Report",
+        "topic": d.run.get("topic", ""),
+        "run_id": d.run.get("run_id", ""),
+        "generated": d.run.get("completed_at") or d.run.get("created_at") or "",
+        "mode": d.contract.get("domain_pack_id") or "generic",
+        "gate_status": "BLOCKED" if not d.approved else ("WARN" if gw else "PASS"),
+        "metrics": {
+            "documents": len(d.documents), "spans": len(d.spans), "evidence": len(d.evidence),
+            "claims": len(d.claims), "claims_accepted": accepted, "citations": len(citations),
+            "citations_youtube": yt, "citations_github": gh,
+            "gates_pass": gp, "gates_warn": gw, "gates_fail": gf, "gates_total": len(d.gate_results),
+        },
+    }
+
+
+# Self-contained dossier styling: one indigo accent, semantic gate colours, an editorial
+# serif-heading / sans-body pairing, zebra tables, sticky section nav, dark-mode + print
+# variants. No external assets, fonts, or JS — the report stays a single portable file.
+_CSS = """
+*{box-sizing:border-box}
+:root{--bg:#fbfbfa;--surface:#fff;--ink:#1c1c1e;--muted:#6b6b76;--line:#e6e6ea;
+--accent:#5a4be7;--accent2:#8b5cf6;--green:#1a7f4b;--green-bg:#e7f5ec;--amber:#8a5d00;
+--amber-bg:#fdf3e0;--red:#b3261e;--red-bg:#fbe9e7;--yt:#c4302b;--gh:#5a4be7;
+--serif:Georgia,"Times New Roman",serif;--sans:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;
+--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.62;font-size:16px}
+.topbar{height:6px;background:linear-gradient(90deg,var(--accent),var(--accent2))}
+.report-header{max-width:920px;margin:0 auto;padding:30px 24px 6px}
+.report-header h1{font-family:var(--serif);font-size:30px;line-height:1.2;margin:0 0 6px}
+.report-header .topic{font-size:18px;color:var(--muted);margin:0 0 14px}
+.report-header .meta{font-family:var(--mono);font-size:12.5px;color:var(--muted);display:flex;
+gap:16px;flex-wrap:wrap;align-items:center}
+.badge{padding:3px 11px;border-radius:999px;font-weight:600;font-size:12px;font-family:var(--sans)}
+.badge.pass{background:var(--green-bg);color:var(--green)}
+.badge.warn{background:var(--amber-bg);color:var(--amber)}
+.badge.blocked{background:var(--red-bg);color:var(--red)}
+.metric-band{max-width:920px;margin:18px auto;padding:0 24px;display:grid;
+grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px}
+.metric{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:13px 16px}
+.metric .num{font-size:24px;font-weight:700;font-family:var(--serif)}
+.metric .lbl{font-size:11.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-top:2px}
+.metric .sub{font-size:11.5px;color:var(--muted);margin-top:5px}
+.report-nav{position:sticky;top:0;z-index:5;background:rgba(251,251,250,.92);
+backdrop-filter:blur(6px);border-bottom:1px solid var(--line)}
+.report-nav ul{max-width:920px;margin:0 auto;padding:11px 24px;display:flex;gap:18px;
+flex-wrap:wrap;list-style:none;font-size:13px}
+.report-nav a{color:var(--muted);text-decoration:none}
+.report-nav a:hover{color:var(--accent)}
+.report-main{max-width:920px;margin:0 auto;padding:8px 24px 30px}
+.report-section{background:var(--surface);border:1px solid var(--line);border-radius:14px;
+padding:4px 22px 18px;margin:18px 0}
+.report-section h2{font-family:var(--serif);font-size:21px;border-bottom:2px solid var(--line);
+padding-bottom:8px;margin:18px 0 14px}
+.report-section h3{font-size:15px;color:var(--accent);margin:18px 0 8px}
+table{border-collapse:collapse;width:100%;font-size:13.5px;margin:10px 0;
+border:1px solid var(--line);border-radius:10px;overflow:hidden}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+thead th{background:#f2f2f5;font-size:11.5px;text-transform:uppercase;letter-spacing:.03em;color:var(--muted)}
+tbody tr:nth-child(even){background:#fafafb}
+ul{padding-left:20px}li{margin:5px 0}
+blockquote{margin:12px 0;padding:9px 14px;border-left:4px solid var(--amber);
+background:var(--amber-bg);border-radius:0 8px 8px 0;color:#6a4e16}
+a{color:var(--accent)}
+main a[href*="youtube.com"]{color:var(--yt);text-decoration:none;font-weight:600}
+main a[href*="youtube.com"]::before{content:"\\23F1  "}
+main a[href*="github.com"]{color:var(--gh);text-decoration:none;font-weight:600}
+main a[href*="github.com"]::before{content:"#\\2009";font-family:var(--mono)}
+.report-footer{max-width:920px;margin:0 auto;padding:18px 24px 50px;color:var(--muted);
+font-size:12px;font-family:var(--mono);border-top:1px solid var(--line)}
+@media (max-width:640px){.report-header h1{font-size:24px}
+.report-main,.report-header,.metric-band{padding-left:16px;padding-right:16px}}
+@media (prefers-color-scheme:dark){:root{--bg:#161618;--surface:#1f1f23;--ink:#e9e9ec;
+--muted:#9a9aa6;--line:#2c2c33;--green-bg:#13301f;--amber-bg:#332811;--red-bg:#3a1714;
+--yt:#ff7b73;--gh:#a899ff;--accent:#a899ff}
+thead th{background:#26262c}tbody tr:nth-child(even){background:#1b1b1f}
+blockquote{color:#d8c79a}}
+@media print{.report-nav{display:none}.report-section{break-inside:avoid;border:none;padding:0}}
+"""
+
+
+def render_html(markdown: str, title: str, view_model: dict | None = None) -> str:
+    """Render the Markdown report to a self-contained, styled HTML dossier (embedded CSS,
+    no external assets/JS). With a view model it adds a header, gate badge, metric band, and
+    sticky section nav; without one it falls back to a minimal body render. Citation anchors
+    keep the exact `<a href="URL">LABEL</a>` shape — deep-link colour-coding is pure CSS."""
+    body, sections = _convert_body(markdown.split("\n"), drop_first_h1=bool(view_model))
+    if not view_model:
+        return ("<!doctype html><html><head><meta charset='utf-8'>"
+                f"<title>{_html.escape(title)}</title></head><body>{body}</body></html>")
+    head = ("<meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+            f"<title>{_html.escape(title)}</title><style>{_CSS}</style>")
+    return ("<!doctype html><html lang='en'><head>" + head + "</head><body>"
+            "<div class='topbar'></div>"
+            + _header_html(view_model) + _metric_band_html(view_model) + _nav_html(sections)
+            + "<main class='report-main'>" + body + "</main>" + _footer_html(view_model)
+            + "</body></html>")
+
+
+def _slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "section"
+
+
+def _convert_body(lines: list[str], drop_first_h1: bool) -> tuple[str, list[tuple[str, str]]]:
+    """Markdown->HTML for headings, tables, lists, quotes. `## ` headings open styled
+    `<section>`s (collected for the nav); the leading `# ` title is dropped when the header
+    renders it instead."""
+    out: list[str] = []
+    sections: list[tuple[str, str]] = []
+    open_section = False
+    dropped = not drop_first_h1
+    i = 0
     while i < len(lines):
         line = lines[i]
+        if line.startswith("# ") and not dropped:
+            dropped = True
+            i += 1
+            continue
         if line.startswith("### "):
             out.append(f"<h3>{_html.escape(line[4:])}</h3>")
         elif line.startswith("## "):
-            out.append(f"<h2>{_html.escape(line[3:])}</h2>")
+            text = line[3:]
+            slug = _slug(text)
+            if open_section:
+                out.append("</section>")
+            out.append(f"<section id='{slug}' class='report-section'><h2>{_html.escape(text)}</h2>")
+            sections.append((slug, text))
+            open_section = True
         elif line.startswith("# "):
             out.append(f"<h1>{_html.escape(line[2:])}</h1>")
         elif line.startswith("> "):
-            out.append(f"<blockquote>{_html.escape(line[2:])}</blockquote>")
+            out.append(f"<blockquote>{_inline(line[2:])}</blockquote>")
         elif line.startswith("|"):
             table, j = [], i
             while j < len(lines) and lines[j].startswith("|"):
@@ -235,8 +363,56 @@ def render_html(markdown: str, title: str) -> str:
         elif line.strip():
             out.append(f"<p>{_inline(line)}</p>")
         i += 1
-    return ("<!doctype html><html><head><meta charset='utf-8'>"
-            f"<title>{_html.escape(title)}</title></head><body>" + "".join(out) + "</body></html>")
+    if open_section:
+        out.append("</section>")
+    return "".join(out), sections
+
+
+def _header_html(vm: dict) -> str:
+    cls = {"PASS": "pass", "WARN": "warn", "BLOCKED": "blocked"}.get(vm["gate_status"], "warn")
+    meta = [f"Run {_html.escape(vm['run_id'])}"]
+    if vm.get("generated"):
+        meta.append(f"Generated {_html.escape(vm['generated'])}")
+    meta.append(f"Mode {_html.escape(vm['mode'])}")
+    meta_html = "".join(f"<span>{m}</span>" for m in meta)
+    return ("<header class='report-header'>"
+            f"<h1>{_html.escape(vm['heading'])}</h1>"
+            f"<p class='topic'>{_html.escape(vm['topic'])}</p>"
+            f"<div class='meta'>{meta_html}<span class='badge {cls}'>{vm['gate_status']}</span></div></header>")
+
+
+def _metric_band_html(vm: dict) -> str:
+    m = vm["metrics"]
+    cards = [
+        (m["documents"], "Documents", ""),
+        (m["spans"], "Spans", ""),
+        (m["evidence"], "Evidence", ""),
+        (m["claims_accepted"], "Claims", f"{m['claims_accepted']} of {m['claims']} accepted"),
+        (m["citations"], "Deep Links", f"⏱ {m['citations_youtube']}  ·  # {m['citations_github']}"),
+        (f"{m['gates_pass']}/{m['gates_total']}", "Gates Passed", f"{m['gates_warn']} warn · {m['gates_fail']} fail"),
+    ]
+    out = ["<section class='metric-band'>"]
+    for num, lbl, sub in cards:
+        sub_html = f"<div class='sub'>{_html.escape(str(sub))}</div>" if sub else ""
+        out.append(f"<div class='metric'><div class='num'>{_html.escape(str(num))}</div>"
+                   f"<div class='lbl'>{_html.escape(lbl)}</div>{sub_html}</div>")
+    out.append("</section>")
+    return "".join(out)
+
+
+def _nav_html(sections: list[tuple[str, str]]) -> str:
+    if not sections:
+        return ""
+    links = "".join(f"<li><a href='#{s}'>{_html.escape(t)}</a></li>" for s, t in sections)
+    return f"<nav class='report-nav'><ul>{links}</ul></nav>"
+
+
+def _footer_html(vm: dict) -> str:
+    bits = [f"Run {_html.escape(vm['run_id'])}"]
+    if vm.get("generated"):
+        bits.append(_html.escape(vm["generated"]))
+    bits.append("Phase 0 · deterministic research compiler")
+    return f"<footer class='report-footer'>{' · '.join(bits)}</footer>"
 
 
 def _html_table(rows: list[str]) -> str:
@@ -248,7 +424,7 @@ def _html_table(rows: list[str]) -> str:
     body = [cells(r) for r in rows[2:]]  # row 1 is the markdown separator
     thead = "<tr>" + "".join(f"<th>{_inline(c)}</th>" for c in header) + "</tr>"
     tbody = "".join("<tr>" + "".join(f"<td>{_inline(c)}</td>" for c in r) + "</tr>" for r in body)
-    return f"<table border='1'>{thead}{tbody}</table>"
+    return f"<table>{thead}{tbody}</table>"
 
 
 def _inline(s: str) -> str:

@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import sys
 
+from ..termstyle import Style
 from .build import run_fetch
 from .clients import FetchDependencyError
 
@@ -61,14 +62,37 @@ def main(argv: list[str] | None = None) -> int:
     except FetchDependencyError as exc:
         print(f"missing fetch dependency: {exc}\nrun: pip install ai4research[fetch]", file=sys.stderr)
         return 1
-    print(f"pack written: {args.out}/source_containers.jsonl")
-    for k in ("channels", "videos", "transcripts", "video_gaps", "repos", "repo_gaps"):
-        print(f"  {k}: {summary[k]}")
-    for err in summary["errors"]:
-        print(f"  ! {err}", file=sys.stderr)
-    print("\nNext: python -m ai4research demo --topic '<topic>' "
-          f"--source-pack {args.out}/source_containers.jsonl --domain-pack youtube_github_research")
+    _print_fetch_summary(args.out, args.query, summary)
     return 0
+
+
+def _print_fetch_summary(out: str, query: str | None, summary: dict) -> None:
+    """Compact source-pack summary: what was gathered and — importantly — what was missed
+    (coverage gaps / errors are highlighted, never buried). Plain text off a TTY."""
+    s = Style()
+    pack = f"{out}/source_containers.jsonl"
+    dot = s(" · ", "dim")
+
+    def row(label: str, value: str) -> None:
+        print(f"  {s(label.ljust(10), 'dim')}{value}")
+
+    def gaps(n: int) -> str:
+        return s(f"  ({n} gaps)", "yellow") if n else ""
+
+    if s.enabled:
+        print("\n  " + s("ai4research-fetch", "cyan", "bold"))
+    print()
+    if query:
+        row("query", query)
+    row("pack", s(f"{s.glyph('pass')} ", "green") + pack)
+    row("youtube", f"{summary['channels']} sources{dot}{summary['videos']} videos"
+                   f"{dot}{summary['transcripts']} transcripts" + gaps(summary["video_gaps"]))
+    row("github", f"{summary['repos']} repos" + gaps(summary["repo_gaps"]))
+    for err in summary["errors"]:
+        print("  " + s(f"{s.glyph('warning')} {err}", "yellow"), file=sys.stderr)
+    print()
+    row("next", f"ai4research demo --topic '<topic>' --source-pack {pack} "
+                "--domain-pack youtube_github_research")
 
 
 if __name__ == "__main__":

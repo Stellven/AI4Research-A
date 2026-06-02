@@ -44,13 +44,12 @@ class HtmlRenderOperator(Operator):
     OUTPUT_SCHEMAS = ["artifact_exports"]
 
     def run(self, ctx: RunContext, work: WorkStore, pipeline: list[Operator]) -> dict:
-        dossier = (work.read_rows("quality_dossier") or [{}])[0]
-        approved = bool(dossier.get("approved_for_report_rendering"))
-        md_name = "final_report.md" if approved else "diagnostic_report.md"
+        data = report.ReportData(work)
+        md_name = "final_report.md" if data.approved else "diagnostic_report.md"
         markdown = (ctx.exports_dir / md_name).read_text(encoding="utf-8")
         title = markdown.split("\n", 1)[0].lstrip("# ").strip()
-        html = report.render_html(markdown, title)
+        html = report.render_html(markdown, title, report.build_view_model(data))
         path = ctx.exports_dir / md_name.replace(".md", ".html")
         path.write_text(html, encoding="utf-8")
         work.append_row("artifact_exports", _export_row(ctx, path, "html_report", html, 1))
-        return {"approved": int(approved), "bytes": len(html)}
+        return {"approved": int(data.approved), "bytes": len(html)}
