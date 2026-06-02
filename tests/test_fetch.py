@@ -342,5 +342,44 @@ class QueryPlanningTest(unittest.TestCase):
         self.assertEqual(calls, ["ai GEPA", "GEPA"])
 
 
+class YtDlpListerTest(unittest.TestCase):
+    """YtDlpChannelLister enriches flat (dateless) entries with real upload dates (#15) — yt_dlp
+    is mocked, so this runs without the optional dependency or the network."""
+
+    @staticmethod
+    def _fake_ydl(flat_entries, dates):
+        class FakeYDL:
+            def __init__(self, opts):
+                self.flat = bool(opts.get("extract_flat"))
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def extract_info(self, url, download=False):
+                if self.flat:
+                    return {"entries": flat_entries}
+                vid = url.rsplit("=", 1)[-1]
+                return {"upload_date": dates.get(vid)}
+        return types.SimpleNamespace(YoutubeDL=FakeYDL)
+
+    def test_enriches_dates_and_sorts_recent_first(self):
+        fake = self._fake_ydl([{"id": "v1", "title": "older"}, {"id": "v2", "title": "newer"}],
+                              {"v1": "20260115", "v2": "20260601"})
+        with mock.patch.dict(sys.modules, {"yt_dlp": fake}):
+            from ai4research.fetch.clients import YtDlpChannelLister
+            vids = YtDlpChannelLister().list_videos("ytsearch2:x", None, 2)
+        self.assertEqual([v.video_id for v in vids], ["v2", "v1"])      # newest first
+        self.assertEqual(vids[0].published_at, "2026-06-01")
+        self.assertEqual(vids[1].published_at, "2026-01-15")
+
+    def test_since_filter_uses_enriched_dates(self):
+        fake = self._fake_ydl([{"id": "old", "title": "o"}, {"id": "new", "title": "n"}],
+                              {"old": "20240101", "new": "20260601"})
+        with mock.patch.dict(sys.modules, {"yt_dlp": fake}):
+            from ai4research.fetch.clients import YtDlpChannelLister
+            vids = YtDlpChannelLister().list_videos("ytsearch2:x", "2026-01-01", 2)
+        self.assertEqual([v.video_id for v in vids], ["new"])           # 'old' (2024) excluded by since
+
+
 if __name__ == "__main__":
     unittest.main()

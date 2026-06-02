@@ -147,9 +147,10 @@ def _search_relaxations(query: str):
 # --- real implementations (lazy imports; exercised live only by the optional smoke test) ---
 
 class YtDlpChannelLister:
-    """Enumerate a channel's recent uploads via yt-dlp (no API key). NOTE: flat extraction
-    often omits publish dates; when a date is unavailable the item is kept (it cannot be
-    excluded by `since`). For strict freshness windows, full extraction is required."""
+    """Enumerate a channel's/search's uploads via yt-dlp (no API key). Flat extraction is fast
+    but omits publish dates, so the top candidates are then enriched with a per-video metadata
+    fetch (capped for cost) — this is what makes freshness filtering and 'latest' ordering work.
+    Items whose date is still unknown are kept (they cannot be excluded by `since`)."""
 
     def list_videos(self, channel_url: str, since: str | None, max_items: int | None) -> list[VideoMeta]:
         try:
@@ -165,14 +166,24 @@ class YtDlpChannelLister:
             vid = entry.get("id")
             if not vid:
                 continue
-            published = _entry_date(entry)
-            if since and published and published < since:
-                continue
             videos.append(VideoMeta(
                 video_id=vid, url=f"https://www.youtube.com/watch?v={vid}",   # canonical so the &t= deep-link joins correctly
-                title=entry.get("title") or vid, published_at=published))
-        videos.sort(key=lambda v: v.published_at or "", reverse=True)
-        return videos[:max_items] if max_items else videos
+                title=entry.get("title") or vid, published_at=_entry_date(entry)))
+        # Flat listings omit dates; enrich the top candidates (in flat order) with a full
+        # per-video fetch so `since` filtering + recency sort below operate on real dates.
+        candidates = videos[:max_items] if max_items else videos
+        with yt_dlp.YoutubeDL({"quiet": True, "skip_download": True}) as ydl:
+            for v in candidates:
+                if v.published_at:
+                    continue
+                try:
+                    meta = ydl.extract_info(v.url, download=False)
+                    v.published_at = _iso_from_ytdlp(meta.get("upload_date")) or _entry_date(meta)
+                except Exception:  # noqa: BLE001 - date enrichment is best-effort; an unknown date is kept
+                    pass
+        kept = [v for v in candidates if not (since and v.published_at and v.published_at < since)]
+        kept.sort(key=lambda v: v.published_at or "", reverse=True)
+        return kept
 
 
 class YouTubeTranscriptFetcher:
