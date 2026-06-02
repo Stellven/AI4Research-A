@@ -32,6 +32,7 @@ class ReportData:
         self.citations = rows("citations")
         self.figures = rows("figures")
         self.answer = rows("answer")
+        self.question_nodes = rows("question_graph_nodes")
         self.approved = bool(self.dossier.get("approved_for_report_rendering"))
 
         self.by_item = {i["selected_item_id"]: i for i in self.items}
@@ -43,43 +44,95 @@ class ReportData:
 
 
 def _summary(d: ReportData) -> list[str]:
-    acquired = sum(1 for a in d.attempts if a["status"] == "succeeded")
-    gaps = sum(1 for a in d.attempts if a["status"] != "succeeded")
-    status = d.dossier.get("overall_status", "unknown")
-    return [
-        "## Executive Run Summary", "",
-        f"Run `{d.run.get('run_id')}` processed {len(d.items)} supplied item(s) "
-        f"({acquired} acquired, {gaps} gap(s)) across {len(d.containers)} container(s). "
-        f"Gate status: **{status}**. No live retrieval (Phase 0).", "",
-        f"- Topic: {d.run.get('topic')}",
-        f"- Documents: {len(d.documents)} | Spans: {len(d.spans)} | "
-        f"Evidence: {len(d.evidence)} | Claims: {len(d.claims)} | Citations: {len(d.citations)}", "",
-    ]
+    """The 'How this was researched' methodology surface — provenance in plain terms (angles →
+    sources → claims → findings), scope, and any advisories — computed from real artifact counts,
+    not raw gate tallies."""
+    angles = sum(1 for n in d.question_nodes if n.get("type") == "sub_question")
+    yt = sum(1 for c in d.containers if c.get("source_pack_type") == "youtube_channel")
+    gh = sum(1 for c in d.containers if c.get("source_pack_type") == "github_repo")
+    findings = len((d.answer[0].get("key_findings") or [])) if d.answer else 0
+    mix = ", ".join(p for p in [f"{yt} YouTube" if yt else "", f"{gh} GitHub" if gh else ""] if p) \
+        or f"{len(d.containers)} container(s)"
+    window = d.contract.get("freshness_window_days")
+    method = (
+        f"Compiled from {len(d.documents)} sources ({mix}) on **{d.run.get('topic')}**. "
+        f"The pipeline decomposed the topic into {angles} angle(s), extracted {len(d.evidence)} "
+        f"evidence spans into {len(d.claims)} claims, "
+        + (f"and synthesized {findings} findings — every citation checked against the evidence, "
+           "ungrounded ones dropped."
+           if findings else
+           "rendered as the evidence-backed claims below (no LLM synthesis on this run).")
+    )
+    scope = ("Scope: within the provided source set; no live web retrieval (Phase 0)."
+             + (f" Freshness window: {window} days." if window else ""))
+    out = ["## How this was researched", "", method, "", scope, ""]
+    advisories = [g for g in d.gate_results if g.get("status") == "warning"]
+    if advisories:
+        for g in advisories:
+            issues = "; ".join(g.get("issues") or []) or g["gate_id"]
+            out.append(f"- _Advisory:_ {issues}")
+        out.append("")
+    return out
 
 
 def _answer_section(d: ReportData) -> list[str]:
-    """The synthesized findings brief (Increment 5) — present only when an LLM run produced a
-    grounded answer: an executive summary plus a ranked list of the most material findings, each
-    with its cited evidence resolved to deep links."""
+    """The synthesized dossier (Increment 5) — present only when an LLM run produced a grounded
+    answer: a long summary, an at-a-glance findings list with confidence, thematic angle sections,
+    a forward outlook, and caveats / open questions. Inline [evidence_id] refs become deep links."""
     if not d.answer:
         return []
     a = d.answer[0]
-    out = ["## Key Findings", ""]
-    summary = (a.get("executive_summary") or "").strip()
+    out = ["## Summary", ""]
+    summary = _linkify_evidence(a.get("summary", ""), d)
     if summary:
         out += [summary, ""]
-    for item in a.get("key_findings", []):
-        text = (item.get("finding") or "").strip()
-        if not text:
-            continue
-        cites = []
-        for eid in item.get("evidence_ids", []):
-            cite = d.cite_by_evidence.get(eid)
-            if cite:
-                cites.append(f"[{cite['label']}]({cite['url']})" if cite.get("url") else f"[{cite['label']}]")
-        out.append(f"- {text}" + ((" " + " ".join(cites)) if cites else ""))
-    out.append("")
+    findings = a.get("key_findings", [])
+    if findings:
+        out += ["### Key findings at a glance", ""]
+        for item in findings:
+            text = (item.get("finding") or "").strip()
+            if not text:
+                continue
+            cites = _cites(item.get("evidence_ids", []), d)
+            conf = (item.get("confidence") or "").strip().capitalize()
+            tag = f"  _({conf} confidence)_" if conf else ""
+            out.append(f"- {text}" + ((" " + cites) if cites else "") + tag)
+        out.append("")
+    for sec in a.get("sections", []):
+        title = (sec.get("title") or "").strip()
+        body = _linkify_evidence(sec.get("body", ""), d)
+        if title and body:
+            out += [f"### {title}", "", body, ""]
+    outlook = a.get("outlook") or []
+    if outlook:
+        out += ["### Where it's heading", ""] + [f"- {_linkify_evidence(x, d)}" for x in outlook] + [""]
+    caveats = a.get("caveats") or []
+    open_q = a.get("open_questions") or []
+    if caveats or open_q:
+        out += ["### Caveats & open questions", ""]
+        out += [f"- {_linkify_evidence(x, d)}" for x in caveats]
+        out += [f"- _Open:_ {x}" for x in open_q]
+        out.append("")
     return out
+
+
+def _linkify_evidence(text: str, d: ReportData) -> str:
+    """Resolve inline `[evidence_id]` references in synthesized prose to citation deep links."""
+    def repl(match):
+        cite = d.cite_by_evidence.get(match.group(1))
+        if not cite:
+            return match.group(0)
+        return f"[{cite['label']}]({cite['url']})" if cite.get("url") else f"[{cite['label']}]"
+    return re.sub(r"\[([\w.:-]+)\]", repl, text or "")
+
+
+def _cites(evidence_ids: list, d: ReportData) -> str:
+    parts = []
+    for eid in evidence_ids:
+        cite = d.cite_by_evidence.get(eid)
+        if cite:
+            parts.append(f"[{cite['label']}]({cite['url']})" if cite.get("url") else f"[{cite['label']}]")
+    return " ".join(parts)
 
 
 def _coverage(d: ReportData) -> list[str]:
@@ -216,8 +269,11 @@ def render_markdown(d: ReportData) -> tuple[str, str]:
     topic = d.run.get("topic", "")
     if d.approved:
         title = f"Phase 0 Evidence Report: {topic}"
-        body = (_answer_section(d) + _summary(d) + _coverage(d) + _findings(d) + _figures(d)
-                + _evidence_table(d) + _gaps(d) + _traceability(d) + _full_source_appendix(d))
+        # dossier leads; the "How this was researched" methodology sits near the end (like the
+        # exemplar) before the source appendix; evidence + traceability are the audit detail.
+        body = (_answer_section(d) + _coverage(d) + _findings(d) + _figures(d)
+                + _evidence_table(d) + _gaps(d) + _traceability(d) + _summary(d)
+                + _full_source_appendix(d))
         kind = "markdown_report"
     else:
         title = f"Phase 0 Diagnostic Report: {topic}"
@@ -419,7 +475,10 @@ def _metric_band_html(vm: dict) -> str:
         (m["documents"], "Documents", f"{m['spans']} spans"),
         (m["evidence"], "Evidence", f"{m['claims']} claims (ledger)"),
         (m["citations"], "Deep Links", f"⏱ {m['citations_youtube']}  ·  # {m['citations_github']}"),
-        (f"{m['gates_pass']}/{m['gates_total']}", "Gates Passed", f"{m['gates_warn']} warn · {m['gates_fail']} fail"),
+        # user-legible quality, not a raw gate tally (#21): passed/blocked + advisory count
+        ("✗ Blocked" if m["gates_fail"] else "✓ Passed", "Quality checks",
+         (f"{m['gates_warn']} advisory" if m["gates_warn"] == 1 else f"{m['gates_warn']} advisories")
+         if m["gates_warn"] else "all clear"),
     ]
     out = ["<section class='metric-band'>"]
     for num, lbl, sub in cards:

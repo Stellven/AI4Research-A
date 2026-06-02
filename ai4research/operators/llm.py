@@ -7,6 +7,7 @@ AnswerSynthesis -> a deterministic grounding pass that keeps only citations it c
 from __future__ import annotations
 
 import json
+import re
 
 from .. import ids
 from ..model_runtime import ModelRuntime, ModelRuntimeError, get_runtime
@@ -117,17 +118,18 @@ def _prompt(claims: list[dict], evidence: dict[str, dict]) -> str:
     return "\n".join(lines)
 
 
-# --- Increment 5: render-phase synthesis of the findings brief ---------------------------
+# --- Increment 5: render-phase synthesis of the report dossier ---------------------------
 
-# codex's --output-schema requires a top-level object (strict mode: every field required, no
-# extra properties). The brief is an executive summary plus a ranked list of the most material
-# findings, each carrying the ids of the evidence that supports it.
+# codex's --output-schema requires a top-level object (strict mode: every property required,
+# additionalProperties:false at every level). The dossier = a long synthesized summary, an
+# at-a-glance findings list (each with its evidence ids), thematic angle sections, a forward
+# outlook, caveats, and open questions. Evidence is cited inline by id in the prose.
 ANSWER_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["executive_summary", "key_findings"],
+    "required": ["summary", "key_findings", "sections", "outlook", "caveats", "open_questions"],
     "properties": {
-        "executive_summary": {"type": "string"},
+        "summary": {"type": "string"},
         "key_findings": {
             "type": "array",
             "items": {
@@ -140,18 +142,59 @@ ANSWER_SCHEMA = {
                 },
             },
         },
+        "sections": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["title", "body"],
+                "properties": {"title": {"type": "string"}, "body": {"type": "string"}},
+            },
+        },
+        "outlook": {"type": "array", "items": {"type": "string"}},
+        "caveats": {"type": "array", "items": {"type": "string"}},
+        "open_questions": {"type": "array", "items": {"type": "string"}},
     },
 }
 
+_EVIDENCE_REF = re.compile(r"\[([\w.:-]+)\]")
+
+
+def _ground_prose(text: str, valid: set) -> tuple[str, int, int]:
+    """Keep inline [evidence_id] refs the model could ground; strip any it invented. Returns
+    (clean_text, kept, dropped). Valid refs stay in the text for the renderer to deep-link."""
+    kept = dropped = 0
+
+    def repl(match):
+        nonlocal kept, dropped
+        if match.group(1) in valid:
+            kept += 1
+            return match.group(0)
+        dropped += 1
+        return ""
+
+    cleaned = _EVIDENCE_REF.sub(repl, text or "")
+    return re.sub(r"[ \t]{2,}", " ", cleaned).strip(), kept, dropped
+
+
+def _confidence(evidence_ids: list, ev_to_container: dict) -> str:
+    """Code-computed confidence from evidence density + source diversity (not a model self-rating)."""
+    containers = {ev_to_container.get(e) for e in evidence_ids if ev_to_container.get(e)}
+    if len(containers) >= 2:
+        return "high"
+    if len(evidence_ids) >= 2:
+        return "medium"
+    return "low"
+
 
 class AnswerSynthesisOperator(Operator):
-    """Render-phase synthesis: with all claims built and gated, an LLM acts as an analyst and
-    writes the report's findings brief — an executive summary plus a ranked, selective list of
-    the most material findings, each citing the evidence that supports it. A deterministic pass
-    then keeps only citations the model could ground in the evidence catalog and drops any
-    finding it could not ground (no garbage), recording an AnswerGroundingGate row. Off unless a
-    live runtime is selected — the default stub proposes nothing, so the report is unchanged.
-    The model proposes the prose; code validates the citations."""
+    """Render-phase synthesis: with all claims built and gated, an LLM acts as a senior analyst
+    and writes the report dossier — a long synthesized summary, an at-a-glance findings list,
+    thematic angle sections, a forward outlook, caveats, and open questions. A deterministic pass
+    keeps only citations the model could ground in the evidence catalog (dropping invented refs
+    and ungrounded findings/sections) and computes per-finding confidence from source diversity;
+    it records an AnswerGroundingGate row. Off unless a live runtime is selected. The model
+    proposes the prose; code validates the citations and calibrates confidence."""
 
     NAME = "AnswerSynthesisOperator"
     INPUT_SCHEMAS = ["claims", "evidence", "claim_evidence", "question_graph_nodes"]
@@ -178,6 +221,9 @@ class AnswerSynthesisOperator(Operator):
                     used[eid] = evidence[eid]
         if not used:
             return {"enabled": 1, "reason": "no accepted evidence"}
+        item_container = {i["selected_item_id"]: i.get("container_id")
+                          for i in work.read_rows("selected_source_items")}
+        ev_to_container = {eid: item_container.get(ev.get("selected_item_id")) for eid, ev in used.items()}
 
         run_config = _read_run_config(ctx)
         runtime_name = run_config.get("model_runtime", "stub")
@@ -195,72 +241,101 @@ class AnswerSynthesisOperator(Operator):
 
         draft = records[0]
         valid = set(used)
-        kept_refs = dropped_refs = dropped_findings = 0
+        kept = dropped = 0
+
+        summary, k, d = _ground_prose(str(draft.get("summary", "")), valid)
+        kept += k
+        dropped += d
+
         findings = []
         for item in (draft.get("key_findings") or []):
             text = str(item.get("finding", "")).strip()
             cited = [e for e in (item.get("evidence_ids") or []) if isinstance(e, str)]
             grounded = [e for e in cited if e in valid]
-            dropped_refs += len(cited) - len(grounded)
+            dropped += len(cited) - len(grounded)
             if text and grounded:
-                findings.append({"finding": text, "evidence_ids": grounded})
-                kept_refs += len(grounded)
-            elif text:
-                dropped_findings += 1   # an ungrounded finding -> dropped (no garbage)
-        if not findings:
+                findings.append({"finding": text, "evidence_ids": grounded,
+                                 "confidence": _confidence(grounded, ev_to_container)})
+                kept += len(grounded)
+
+        sections = []
+        for sec in (draft.get("sections") or []):
+            title = str(sec.get("title", "")).strip()
+            body, k, d = _ground_prose(str(sec.get("body", "")), valid)
+            kept += k
+            dropped += d
+            if title and k > 0:           # a section must carry at least one grounded citation
+                sections.append({"title": title, "body": body})
+
+        def _ground_items(items):
+            nonlocal kept, dropped
+            out = []
+            for raw in items or []:
+                text, k2, d2 = _ground_prose(str(raw), valid)
+                kept += k2
+                dropped += d2
+                if text:
+                    out.append(text)
+            return out
+
+        outlook = _ground_items(draft.get("outlook"))
+        caveats = _ground_items(draft.get("caveats"))
+        open_questions = [str(x).strip() for x in (draft.get("open_questions") or []) if str(x).strip()]
+
+        if not findings and not sections:
             return {"enabled": 1, "runtime": runtime_name, "findings": 0, "reason": "ungrounded"}
 
         work.write_rows("answer", [{
-            "run_id": ctx.run_id,
-            "executive_summary": str(draft.get("executive_summary", "")).strip(),
-            "key_findings": findings, "source": runtime_name,
-            "citations_kept": kept_refs, "citations_dropped": dropped_refs,
-            "findings_dropped": dropped_findings,
+            "run_id": ctx.run_id, "summary": summary, "key_findings": findings, "sections": sections,
+            "outlook": outlook, "caveats": caveats, "open_questions": open_questions,
+            "source": runtime_name, "sources_count": len(used),
+            "citations_kept": kept, "citations_dropped": dropped,
         }])
-        issues = []
-        if dropped_findings:
-            issues.append(f"dropped {dropped_findings} ungrounded finding(s)")
-        if dropped_refs:
-            issues.append(f"stripped {dropped_refs} ungrounded citation(s)")
         work.append_row("gate_results", {
             "gate_result_id": ids.mint(ctx.run_id, "ANSGATE", 0),
             "run_id": ctx.run_id, "gate_id": "AnswerGroundingGate", "gate_version": "0.1.0",
-            "status": "warning" if issues else "pass", "severity": "warning",
-            "checked_tables": ["answer", "evidence"], "issues": issues,
-            "metrics": {"findings": len(findings), "citations_kept": kept_refs,
-                        "citations_dropped": dropped_refs, "findings_dropped": dropped_findings},
+            "status": "warning" if dropped else "pass", "severity": "warning",
+            "checked_tables": ["answer", "evidence"],
+            "issues": ([f"stripped {dropped} ungrounded citation(s)"] if dropped else []),
+            "metrics": {"findings": len(findings), "sections": len(sections),
+                        "citations_kept": kept, "citations_dropped": dropped},
             "created_at": ids.utc_now_iso(),
         })
         return {"enabled": 1, "runtime": runtime_name, "findings": len(findings),
-                "citations_kept": kept_refs, "citations_dropped": dropped_refs,
-                "findings_dropped": dropped_findings}
+                "sections": len(sections), "citations_kept": kept, "citations_dropped": dropped}
 
 
 def _answer_prompt(topic: str, sub_questions: list[str], evidence: dict[str, dict]) -> str:
     lines = [
-        "You are a research analyst writing the findings brief of a report for a busy decision-maker "
-        "(think investor or associate): high signal, specific, no filler. From the evidence below, "
-        "select ONLY the most material, decision-relevant findings; ignore intros, asides, and minor "
-        "detail. Prefer findings with concrete specifics — numbers, names, comparisons. Rank them, "
-        "most important first, and keep to the 5-8 strongest.",
+        "You are a senior research analyst writing a deep-research dossier that answers the topic. "
+        "Use ONLY the evidence below and cite it inline in square brackets by id, e.g. [EV0001] "
+        "(cite more than one where apt). Connective sentences may be uncited, but never state a fact "
+        "without a citation, and never invent ids.",
         "",
         f"Topic: {topic}",
         "",
-        "Cover these angles where the evidence supports them (do not pad to fill an angle):",
+        "Return JSON with these fields:",
+        "- summary: THE CENTREPIECE and BY FAR THE LONGEST field — at least 6 full paragraphs, "
+        "roughly 600-900 words, longer and richer than all the sections combined. Devote a paragraph "
+        "to each major angle/perspective, then a synthesis paragraph on the throughline, where the "
+        "sources converge AND where they conflict, and what it all means. Write a deep, well-cited "
+        "analytical narrative — never a short abstract or a restatement of the findings list. Do not "
+        "be terse; depth and multiple perspectives are the point.",
+        "- key_findings: the 5-8 most material findings; each one tight sentence with its evidence_ids.",
+        "- sections: 3-5 thematic sections, each {title: an insightful named angle, body: one to three "
+        "paragraphs of grounded narrative with inline [id] citations}. Organize around the angles below.",
+        "- outlook: 3-5 forward-looking 'where this is heading' points (cite where the evidence supports it).",
+        "- caveats: honest limitations — source bias, thin or single-source evidence, conflicting or "
+        "unverified claims.",
+        "- open_questions: genuinely unresolved questions the evidence raises.",
+        "",
+        "Angles to cover where the evidence supports them (do not pad to fill one):",
     ]
     lines += [f"- {q}" for q in sub_questions]
-    lines += ["",
-              "Each finding is one tight, specific sentence plus the ids of the evidence that supports "
-              "it. Cite only ids that genuinely support the sentence; never invent ids.",
-              "",
-              "Evidence (cite by these exact ids):"]
+    lines += ["", "Evidence (cite by these exact ids):"]
     for eid, ev in evidence.items():
         summary = (ev.get("summary") or ev.get("quoted_text") or "").strip().replace("\n", " ")
         if len(summary) > 240:
             summary = summary[:237] + "..."
         lines.append(f"- {eid}: {summary}")
-    lines += ["",
-              'Return JSON {"executive_summary": "<2-3 sentence top-line answer to the topic>", '
-              '"key_findings": [{"finding": "<one specific, material sentence>", '
-              '"evidence_ids": ["<id>", ...]}]}.']
     return "\n".join(lines)

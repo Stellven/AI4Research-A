@@ -189,39 +189,45 @@ class CodexRuntimeSmokeTest(unittest.TestCase):
 
 
 class AnswerSynthesisTest(unittest.TestCase):
-    """Increment 5: the render-phase analyst-brief synthesis (LLM proposes prose, code validates
-    the citations and drops ungrounded findings). Uses a prompt-keyed StubRuntime — no network."""
+    """Increment 5: the render-phase dossier synthesis (summary + at-a-glance findings with
+    confidence + thematic sections + outlook + caveats/open-questions). LLM proposes prose; code
+    grounds the citations, computes confidence, and drops ungrounded findings/sections. Prompt-
+    keyed StubRuntime — no network."""
 
-    def test_findings_brief_is_selective_grounded_and_leads_report(self):
+    def test_dossier_is_grounded_and_leads_report(self):
         def stub(prompt):
-            if "findings brief" not in prompt:   # e.g. the LLMSynthesis prompt — stay silent
+            if "deep-research dossier" not in prompt:   # question-derivation / LLMSynthesis prompts
                 return []
             eid = _first_evidence_id(prompt)
             return [{
-                "executive_summary": "The sources frame the topic in concrete, practical terms.",
+                "summary": f"The sources converge on a clear shift [{eid}]. This sentence connects them.",
                 "key_findings": [
-                    {"finding": "The leading repository shows strong adoption and active releases.",
-                     "evidence_ids": [eid]},
-                    {"finding": "An unsupported claim with only an invented citation.",
-                     "evidence_ids": ["run_x.EV9999"]},
+                    {"finding": "The leading repository shows strong adoption.", "evidence_ids": [eid]},
+                    {"finding": "An unsupported claim.", "evidence_ids": ["run_x.EV9999"]},
                 ],
+                "sections": [
+                    {"title": "Adoption is consolidating", "body": f"Vendors are converging [{eid}] here."},
+                    {"title": "Ungrounded angle", "body": "No citations here at all."},
+                ],
+                "outlook": [f"Standardization will continue [{eid}]."],
+                "caveats": ["Sources are partly vendor marketing."],
+                "open_questions": ["How tamper-resistant is it in practice?"],
             }]
 
         with tempfile.TemporaryDirectory() as tmp:
             ctx, work, result = _run_with_stub(tmp, stub)
             self.assertEqual(result.status, "finalized")
-            answer = work.read_rows("answer")
-            self.assertTrue(answer)
-            self.assertEqual(len(answer[0]["key_findings"]), 1)            # ungrounded finding dropped
-            self.assertGreaterEqual(answer[0]["citations_kept"], 1)
+            a = work.read_rows("answer")[0]
+            self.assertEqual(len(a["key_findings"]), 1)                   # ungrounded finding dropped
+            self.assertEqual(a["key_findings"][0]["confidence"], "low")   # single evidence/container
+            self.assertEqual([s["title"] for s in a["sections"]], ["Adoption is consolidating"])  # ungrounded dropped
             md = (ctx.exports_dir / "final_report.md").read_text(encoding="utf-8")
-            self.assertIn("## Key Findings", md)
-            self.assertIn("The sources frame the topic in concrete, practical terms.", md)
-            self.assertIn("The leading repository shows strong adoption", md)
-            self.assertNotIn("EV9999", md)                                # invented ref never rendered
-            self.assertNotIn("unsupported claim", md)                     # ungrounded finding dropped
-            gate = next(g for g in work.read_rows("gate_results") if g["gate_id"] == "AnswerGroundingGate")
-            self.assertEqual(gate["status"], "warning")                   # something was dropped
+            for marker in ("## Summary", "### Key findings at a glance", "### Adoption is consolidating",
+                           "### Where it's heading", "### Caveats & open questions", "_(Low confidence)_"):
+                self.assertIn(marker, md)
+            self.assertNotIn("EV9999", md)            # invented ref never rendered
+            self.assertNotIn("unsupported claim", md)  # ungrounded finding dropped
+            self.assertNotIn("Ungrounded angle", md)   # ungrounded section dropped
 
 
 class QuestionGraphDerivationTest(unittest.TestCase):

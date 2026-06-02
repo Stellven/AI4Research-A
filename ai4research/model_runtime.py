@@ -38,7 +38,7 @@ class StubRuntime:
 class CodexRuntime:
     name = "codex"
 
-    def __init__(self, timeout: int = 60):
+    def __init__(self, timeout: int = 300):   # synthesis (a long dossier) needs more than 60s
         self.timeout = timeout
 
     def propose(self, prompt: str, schema: dict) -> list[dict]:
