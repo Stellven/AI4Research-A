@@ -3,10 +3,15 @@ name = "ai4research"
 version = "0.1.0"
 description = "Pipeline A — Phase 0: a deterministic, file-first, source-agnostic research-compiler skeleton."
 requires-python = ">=3.10"
-dependencies = []  # standard library only — no network, no API keys
+dependencies = []  # the compiler core is standard library only — no network, no API keys
+
+[project.optional-dependencies]
+# the separate fetch tool (live retrieval); the compiler never imports these
+fetch = ["yt-dlp", "youtube-transcript-api", "requests"]
 
 [project.scripts]
 ai4research = "ai4research.cli:main"
+ai4research-fetch = "ai4research.fetch.cli:main"
 
 [build-system]
 requires = ["hatchling"]
