@@ -188,5 +188,41 @@ class CodexRuntimeSmokeTest(unittest.TestCase):
         self.assertEqual(records, [{"claim_text": "x", "cited_evidence_ids": ["E1"]}])
 
 
+class AnswerSynthesisTest(unittest.TestCase):
+    """Increment 5: the render-phase analyst-brief synthesis (LLM proposes prose, code validates
+    the citations and drops ungrounded findings). Uses a prompt-keyed StubRuntime — no network."""
+
+    def test_findings_brief_is_selective_grounded_and_leads_report(self):
+        def stub(prompt):
+            if "findings brief" not in prompt:   # e.g. the LLMSynthesis prompt — stay silent
+                return []
+            eid = _first_evidence_id(prompt)
+            return [{
+                "executive_summary": "The sources frame the topic in concrete, practical terms.",
+                "key_findings": [
+                    {"finding": "The leading repository shows strong adoption and active releases.",
+                     "evidence_ids": [eid]},
+                    {"finding": "An unsupported claim with only an invented citation.",
+                     "evidence_ids": ["run_x.EV9999"]},
+                ],
+            }]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx, work, result = _run_with_stub(tmp, stub)
+            self.assertEqual(result.status, "finalized")
+            answer = work.read_rows("answer")
+            self.assertTrue(answer)
+            self.assertEqual(len(answer[0]["key_findings"]), 1)            # ungrounded finding dropped
+            self.assertGreaterEqual(answer[0]["citations_kept"], 1)
+            md = (ctx.exports_dir / "final_report.md").read_text(encoding="utf-8")
+            self.assertIn("## Key Findings", md)
+            self.assertIn("The sources frame the topic in concrete, practical terms.", md)
+            self.assertIn("The leading repository shows strong adoption", md)
+            self.assertNotIn("EV9999", md)                                # invented ref never rendered
+            self.assertNotIn("unsupported claim", md)                     # ungrounded finding dropped
+            gate = next(g for g in work.read_rows("gate_results") if g["gate_id"] == "AnswerGroundingGate")
+            self.assertEqual(gate["status"], "warning")                   # something was dropped
+
+
 if __name__ == "__main__":
     unittest.main()

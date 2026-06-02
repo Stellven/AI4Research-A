@@ -31,6 +31,7 @@ class ReportData:
         self.claim_evidence = rows("claim_evidence")
         self.citations = rows("citations")
         self.figures = rows("figures")
+        self.answer = rows("answer")
         self.approved = bool(self.dossier.get("approved_for_report_rendering"))
 
         self.by_item = {i["selected_item_id"]: i for i in self.items}
@@ -54,6 +55,31 @@ def _summary(d: ReportData) -> list[str]:
         f"- Documents: {len(d.documents)} | Spans: {len(d.spans)} | "
         f"Evidence: {len(d.evidence)} | Claims: {len(d.claims)} | Citations: {len(d.citations)}", "",
     ]
+
+
+def _answer_section(d: ReportData) -> list[str]:
+    """The synthesized findings brief (Increment 5) — present only when an LLM run produced a
+    grounded answer: an executive summary plus a ranked list of the most material findings, each
+    with its cited evidence resolved to deep links."""
+    if not d.answer:
+        return []
+    a = d.answer[0]
+    out = ["## Key Findings", ""]
+    summary = (a.get("executive_summary") or "").strip()
+    if summary:
+        out += [summary, ""]
+    for item in a.get("key_findings", []):
+        text = (item.get("finding") or "").strip()
+        if not text:
+            continue
+        cites = []
+        for eid in item.get("evidence_ids", []):
+            cite = d.cite_by_evidence.get(eid)
+            if cite:
+                cites.append(f"[{cite['label']}]({cite['url']})" if cite.get("url") else f"[{cite['label']}]")
+        out.append(f"- {text}" + ((" " + " ".join(cites)) if cites else ""))
+    out.append("")
+    return out
 
 
 def _coverage(d: ReportData) -> list[str]:
@@ -190,8 +216,8 @@ def render_markdown(d: ReportData) -> tuple[str, str]:
     topic = d.run.get("topic", "")
     if d.approved:
         title = f"Phase 0 Evidence Report: {topic}"
-        body = (_summary(d) + _coverage(d) + _findings(d) + _figures(d) + _evidence_table(d)
-                + _gaps(d) + _traceability(d) + _full_source_appendix(d))
+        body = (_answer_section(d) + _summary(d) + _coverage(d) + _findings(d) + _figures(d)
+                + _evidence_table(d) + _gaps(d) + _traceability(d) + _full_source_appendix(d))
         kind = "markdown_report"
     else:
         title = f"Phase 0 Diagnostic Report: {topic}"

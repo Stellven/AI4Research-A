@@ -29,7 +29,7 @@ from .extraction import (
     SpanSegmentOperator,
 )
 from .gates import PreRenderQualityGateSuiteOperator
-from .llm import LLMSynthesisOperator
+from .llm import AnswerSynthesisOperator, LLMSynthesisOperator
 from .render import HtmlRenderOperator, MarkdownReportCompileOperator
 from .runner import OperatorRunner
 from .sources import (
@@ -58,6 +58,7 @@ def build_pipeline(model_runtime=None) -> list[Operator]:
         CitationMapBuildOperator(),
         ReportBlueprintOperator(),
         PreRenderQualityGateSuiteOperator(),
+        AnswerSynthesisOperator(model_runtime),
         MarkdownReportCompileOperator(),
         HtmlRenderOperator(),
     ]
