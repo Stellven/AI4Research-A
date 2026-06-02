@@ -286,5 +286,61 @@ class FetchToolRegressionTest(unittest.TestCase):
             self.assertEqual(once(t1), once(t2))
 
 
+class QueryPlanningTest(unittest.TestCase):
+    """The discovery query planner: deterministic heuristic + optional LLM via the ModelRuntime
+    seam, with a guaranteed heuristic fallback. No network — the LLM path uses StubRuntime."""
+
+    def test_normalize_strips_framing_words_to_keywords(self):
+        from ai4research.fetch.query import normalize_query
+        self.assertEqual(normalize_query("latest development on GEPA"), "GEPA")
+        self.assertEqual(normalize_query("an overview of the current state of RAG"), "RAG")
+        # a query with no framing words is left intact
+        self.assertEqual(normalize_query("skills governance"), "skills governance")
+        # all-filler degrades to the original rather than empty
+        self.assertEqual(normalize_query("the latest news"), "the latest news")
+
+    def test_plan_queries_heuristic_without_runtime(self):
+        from ai4research.fetch.query import plan_queries
+        plan = plan_queries("latest development on GEPA")
+        self.assertEqual(plan["source"], "heuristic")
+        self.assertEqual(plan["github"], "GEPA")
+        self.assertEqual(plan["youtube"], "GEPA")
+
+    def test_plan_queries_uses_llm_records(self):
+        from ai4research.fetch.query import plan_queries
+        from ai4research.model_runtime import StubRuntime
+        rt = StubRuntime(records=[{"github_query": "gepa-ai gepa",
+                                   "youtube_query": "GEPA prompt optimization DSPy"}])
+        plan = plan_queries("latest development on GEPA", rt)
+        self.assertEqual(plan["source"], "stub")
+        self.assertEqual(plan["github"], "gepa-ai gepa")
+        self.assertEqual(plan["youtube"], "GEPA prompt optimization DSPy")
+
+    def test_plan_queries_falls_back_when_runtime_fails_or_empty(self):
+        from ai4research.fetch.query import plan_queries
+        from ai4research.model_runtime import StubRuntime
+        failed = plan_queries("latest development on GEPA", StubRuntime(error=RuntimeError("boom")))
+        self.assertEqual(failed["source"], "heuristic")
+        self.assertEqual(failed["github"], "GEPA")
+        empty = plan_queries("latest development on GEPA", StubRuntime(records=[]))
+        self.assertEqual(empty["source"], "heuristic")
+
+    def test_github_search_relaxes_to_longest_token_on_empty(self):
+        from ai4research.fetch.clients import ApiGitHubClient, _search_relaxations
+        self.assertEqual(list(_search_relaxations("latest development on GEPA")),
+                         ["latest development on GEPA", "development"])
+        # search_repos retries with the relaxed candidate when the full query matches nothing
+        client = ApiGitHubClient()
+        calls = []
+
+        def fake_once(query, limit):
+            calls.append(query)
+            return ["https://github.com/gepa-ai/gepa"] if query == "GEPA" else []
+
+        client._search_repos_once = fake_once  # noqa: SLF001 - exercises the relaxation loop
+        self.assertEqual(client.search_repos("ai GEPA"), ["https://github.com/gepa-ai/gepa"])
+        self.assertEqual(calls, ["ai GEPA", "GEPA"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -131,6 +131,19 @@ def normalize_segments(raw) -> list[dict]:
     return out
 
 
+def _search_relaxations(query: str):
+    """Search candidates, narrowing on failure: the full query, then its longest token
+    (a distinctive acronym/term like 'GEPA' survives where a multi-word AND-query matches none)."""
+    q = (query or "").strip()
+    seen = []
+    tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9.+#-]*", q)
+    longest = max(tokens, key=len) if tokens else ""
+    for candidate in (q, longest):
+        if candidate and candidate not in seen:
+            seen.append(candidate)
+            yield candidate
+
+
 # --- real implementations (lazy imports; exercised live only by the optional smoke test) ---
 
 class YtDlpChannelLister:
@@ -200,6 +213,27 @@ class ApiGitHubClient:
         if self.token:
             h["Authorization"] = f"Bearer {self.token}"
         return h
+
+    def search_repos(self, query: str, limit: int = 5) -> list[str]:
+        """Discover repo URLs by GitHub repository search (most-starred first). GitHub ANDs the
+        query terms, so an over-specified query can match nothing; if so, relax to the single
+        most distinctive token before giving up (a dependency/HTTP error still propagates)."""
+        for candidate in _search_relaxations(query):
+            repos = self._search_repos_once(candidate, limit)
+            if repos:
+                return repos
+        return []
+
+    def _search_repos_once(self, query: str, limit: int) -> list[str]:
+        try:
+            import requests  # noqa: PLC0415
+        except ImportError as exc:
+            raise FetchDependencyError("requests not installed — pip install ai4research[fetch]") from exc
+        resp = requests.get("https://api.github.com/search/repositories", headers=self._headers(),
+                            params={"q": query, "sort": "stars", "order": "desc", "per_page": limit}, timeout=30)
+        resp.raise_for_status()
+        items = resp.json().get("items") or []
+        return [it["html_url"] for it in items if it.get("html_url")][:limit]
 
     def repo_meta(self, repo_url: str, since: str | None) -> RepoMeta:
         try:

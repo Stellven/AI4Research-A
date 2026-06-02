@@ -61,7 +61,7 @@ class CodexRuntime:
                 if proc.returncode != 0:
                     raise ModelRuntimeError((proc.stderr or proc.stdout or "codex exec failed").strip())
                 output = out_path.read_text(encoding="utf-8") if out_path.exists() else proc.stdout
-                data = _parse_json_array(output)
+                data = _parse_records(output)
         except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
             raise ModelRuntimeError(str(exc)) from exc
         return [record for record in data if _valid_record(record, schema)]
@@ -75,25 +75,37 @@ def get_runtime(name: str) -> ModelRuntime:
     raise ModelRuntimeError(f"unknown model runtime: {name}")
 
 
-def _parse_json_array(text: str) -> list[dict]:
+def _parse_records(text: str) -> list[dict]:
+    """Normalize a model's output to a list of records, accepting either an array schema's
+    `[{...}]` or an object schema's `{...}` (codex's --output-schema requires a top-level
+    object, so single-object replies are wrapped)."""
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
-        start, end = text.find("["), text.rfind("]")
-        if start < 0 or end < start:
+        parsed = None
+        for open_c, close_c in (("{", "}"), ("[", "]")):
+            start, end = text.find(open_c), text.rfind(close_c)
+            if 0 <= start < end:
+                try:
+                    parsed = json.loads(text[start:end + 1])
+                    break
+                except json.JSONDecodeError:
+                    continue
+        if parsed is None:
             raise
-        parsed = json.loads(text[start:end + 1])
     if isinstance(parsed, dict) and isinstance(parsed.get("records"), list):
-        parsed = parsed["records"]
-    if not isinstance(parsed, list):
-        raise ModelRuntimeError("model output was not a JSON array")
-    return parsed
+        return parsed["records"]
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict):
+        return [parsed]
+    raise ModelRuntimeError("model output was not a JSON object or array")
 
 
 def _valid_record(record: dict, schema: dict) -> bool:
     if not isinstance(record, dict):
         return False
-    item_schema = schema.get("items", {})
+    item_schema = schema.get("items", schema)  # array schema -> items; object schema -> itself
     required = item_schema.get("required", [])
     properties = item_schema.get("properties", {})
     for key in required:
