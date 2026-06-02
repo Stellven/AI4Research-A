@@ -50,6 +50,8 @@ def cmd_demo(args: argparse.Namespace) -> int:
         run_config["max_items_per_container"] = args.max_per_container
     if args.domain_pack is not None:
         run_config["domain_pack"] = args.domain_pack
+    if args.model_runtime is not None:
+        run_config["model_runtime"] = args.model_runtime
     if run_config:
         (ctx.input_dir / "run_config.json").write_text(json.dumps(run_config, indent=2), encoding="utf-8")
     stage_source_pack(Path(args.source_pack).resolve(), ctx.input_dir / "source_containers.jsonl")
@@ -92,6 +94,7 @@ def main(argv: list[str] | None = None) -> int:
     demo.add_argument("--runs-dir", default="runs")
     demo.add_argument("--max-per-container", type=int, default=None)
     demo.add_argument("--domain-pack", default=None)
+    demo.add_argument("--model-runtime", default=None, choices=["stub", "codex"])
     demo.set_defaults(func=cmd_demo)
 
     args = parser.parse_args(argv)

@@ -22,7 +22,7 @@ JSON_COLS: dict[str, set[str]] = {
     "operator_specs": {"input_schemas", "output_schemas"},
     "optimizer_decisions": {"alternatives_considered"},
     "domain_packs": {"source_families", "vocabulary", "scoring_weights",
-                     "required_sections", "required_gates", "question_template"},
+                     "required_sections", "required_gates", "llm_operators", "question_template"},
     "research_contracts": {"source_policy", "required_dimensions", "critical_claim_policy", "deliverables"},
     "selected_source_items": {"item_locator", "provider_metadata"},
     "acquisition_attempts": {"input_locator"},

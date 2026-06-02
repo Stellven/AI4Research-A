@@ -36,9 +36,9 @@ _GENERIC_TABLE_COLUMNS = {
               "start_char", "end_char", "text", "segmentation_strategy", "text_hash"},
     "evidence": {"evidence_id", "run_id", "selected_item_id", "document_id", "span_id",
                  "evidence_type", "summary", "quoted_text", "support_strength", "limitations",
-                 "published_at", "source_quality_score"},
+                 "published_at", "metric_value", "source_quality_score"},
     "claims": {"claim_id", "run_id", "claim_type", "claim_text", "claim_scope",
-               "claim_kind", "criticality", "status", "confidence", "limitations", "derivation"},
+               "claim_kind", "criticality", "status", "confidence", "limitations", "proposed_by", "derivation"},
     "claim_evidence": {"claim_id", "evidence_id", "role"},
     "citations": {"citation_id", "run_id", "evidence_id", "span_id", "document_id",
                   "selected_item_id", "label", "url", "accessed_at"},
@@ -61,6 +61,7 @@ def _enums() -> dict[tuple[str, str], set[str]]:
     ("claims", "claim_type"): {"definition", "technical_fact", "risk_claim", "recommendation_claim",
                                "trend_claim", "comparison_claim"},
     ("claims", "claim_kind"): {"extractive", "synthesized", "comparative"},
+    ("claims", "proposed_by"): {"metric_synthesis", "llm_synthesis"},
     ("claims", "status"): {"draft", "accepted", "qualified", "rejected"},
     ("claims", "criticality"): {"normal", "critical"},
     ("claim_evidence", "role"): {"supporting", "contradicting", "qualifying"},
@@ -126,7 +127,7 @@ def gate_schema_validation(s, contract):
             seen.add(key)
     for (table, col), allowed in enums.items():
         for row in s.get(table, []):
-            if col in row and row[col] not in allowed:
+            if col in row and row[col] is not None and row[col] not in allowed:
                 issues.append(f"{table}.{col}={row[col]!r} not in {sorted(allowed)}")
     for sp in s.get("spans", []):
         if not (isinstance(sp.get("start_char"), int) and isinstance(sp.get("end_char"), int)
@@ -274,6 +275,8 @@ def gate_synthesis_grounding(s, contract):
     evidence = {e["evidence_id"]: e for e in s.get("evidence", [])}
     issues = []
     for claim in s.get("claims", []):
+        if claim.get("proposed_by") == "llm_synthesis":
+            continue
         if claim.get("claim_kind") not in ("synthesized", "comparative"):
             continue
         derivation = claim.get("derivation")
@@ -284,6 +287,13 @@ def gate_synthesis_grounding(s, contract):
         for inp in inputs:
             if inp.get("evidence_id") not in evidence:
                 issues.append(f"synthesized claim {claim.get('claim_id')} references missing evidence {inp.get('evidence_id')}")
+            else:
+                source_value = evidence[inp.get("evidence_id")].get("metric_value")
+                try:
+                    if source_value is None or abs(float(inp.get("value")) - float(source_value)) > 1e-9:
+                        issues.append(f"synthesized claim {claim.get('claim_id')} input value does not match source evidence")
+                except (TypeError, ValueError):
+                    issues.append(f"synthesized claim {claim.get('claim_id')} input value is not comparable to source evidence")
         method = derivation.get("method")
         computed = derivation.get("computed") or {}
         try:
@@ -310,6 +320,35 @@ def gate_synthesis_grounding(s, contract):
             issues.append(f"synthesized claim {claim.get('claim_id')} derivation is not recomputable")
     status, sev = (HARD_FAIL, BLOCKING) if issues else (PASS, BLOCKING)
     return _result("SynthesisGroundingGate", status, sev, ["claims", "evidence"], issues)
+
+
+def gate_entailment(s, contract):
+    evidence = {e["evidence_id"]: e for e in s.get("evidence", [])}
+    promoted = rejected = 0
+    for claim in s.get("claims", []):
+        if claim.get("proposed_by") != "llm_synthesis":
+            continue
+        derivation = claim.get("derivation") if isinstance(claim.get("derivation"), dict) else {}
+        inputs = derivation.get("inputs") or []
+        cited_ids = [inp.get("evidence_id") for inp in inputs if isinstance(inp, dict)]
+        if not cited_ids or any(eid not in evidence for eid in cited_ids):
+            claim["status"] = "rejected"
+            rejected += 1
+            continue
+        claim_keywords = _keywords(claim.get("claim_text", ""))
+        evidence_keywords = set()
+        for eid in cited_ids:
+            ev = evidence[eid]
+            evidence_keywords.update(_keywords((ev.get("summary") or "") + " " + (ev.get("quoted_text") or "")))
+        coverage = 1.0 if not claim_keywords else len(claim_keywords & evidence_keywords) / len(claim_keywords)
+        if coverage >= 0.6:
+            claim["status"] = "accepted"
+            promoted += 1
+        else:
+            claim["status"] = "rejected"
+            rejected += 1
+    return _result("EntailmentGate", PASS, BLOCKING, ["claims", "evidence"], [],
+                   {"promoted": promoted, "rejected": rejected})
 
 
 def gate_figure_grounding(s, contract):
@@ -406,6 +445,7 @@ GATES = [
     gate_required_rows, gate_schema_validation, gate_provider_quarantine,
     gate_reference_integrity, gate_span_offsets, gate_claim_support, gate_critical_claim,
     gate_citation_resolution, gate_report_grounding, gate_synthesis_grounding, gate_figure_grounding,
+    gate_entailment,
     gate_source_coverage, gate_source_set_limitations,
     gate_question_coverage,
 ]
@@ -456,6 +496,9 @@ class PreRenderQualityGateSuiteOperator(Operator):
         overall = "fail" if blocking_failures else ("warning" if warnings else "pass")
         approved = 0 if blocking_failures else 1
         coverage = next((r["metrics"] for r in results if r["gate_id"] == "QuestionCoverageGate"), {})
+        entailment = next((r["metrics"] for r in results if r["gate_id"] == "EntailmentGate"), {})
+        grounding_level = "entailment_checked" if (entailment.get("promoted", 0) + entailment.get("rejected", 0)) else "traceable"
+        work.write_rows("claims", snap.get("claims", []))
         work.write_rows("gate_results", results)
         work.write_rows("repair_tasks", repair_tasks)
         work.write_rows("quality_dossier", [{
@@ -465,7 +508,7 @@ class PreRenderQualityGateSuiteOperator(Operator):
             "warning_count": warnings,
             "approved_for_report_rendering": approved,
             "coverage": coverage,
-            "grounding_level": "traceable",
+            "grounding_level": grounding_level,
         }])
         return {"gates": len(results), "blocking_failures": blocking_failures,
                 "warnings": warnings, "approved": approved}

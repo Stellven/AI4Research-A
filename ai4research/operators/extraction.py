@@ -106,6 +106,13 @@ def _github_metrics_block(provider_metadata: dict | None) -> str:
     )
 
 
+def _metric_name(row: dict) -> str | None:
+    for entry in row.get("limitations") or []:
+        if isinstance(entry, dict) and entry.get("metric_name"):
+            return entry["metric_name"]
+    return None
+
+
 def _first_sentence(s: str, limit: int = 240) -> str:
     """First sentence as a single clean line (collapsed whitespace) for claim/summary text.
     The verbatim span stays in `quoted_text`; only this derived field is flattened."""
@@ -189,6 +196,30 @@ class EvidenceCardBuildOperator(Operator):
                 continue
             evidence_type = _classify(span_text.lower())
             doc = docs.get(span["document_id"], {})
+            if doc.get("document_kind") == "github_document" and stripped.startswith("Repository metrics"):
+                metadata = doc.get("provider_metadata") if isinstance(doc.get("provider_metadata"), dict) else {}
+                for metric_name, metric_label in (("stars", "stars"), ("releases_in_window", "releases in window")):
+                    value = _numeric(metadata.get(metric_name))
+                    if value is None:
+                        continue
+                    row = {
+                        "evidence_id": ids.mint(ctx.run_id, "EV", len(rows)),
+                        "run_id": ctx.run_id,
+                        "selected_item_id": span["selected_item_id"],
+                        "document_id": span["document_id"],
+                        "span_id": span["span_id"],
+                        "evidence_type": "benchmark" if metric_name == "stars" else "product_release",
+                        "summary": f"Repository metrics - {metric_label}: {value}.",
+                        "quoted_text": span_text,
+                        "support_strength": "single_source",
+                        "limitations": [{"metric_name": metric_name}],
+                        "published_at": doc.get("published_at"),
+                        "metric_value": value,
+                    }
+                    if "source_quality_score" in doc:
+                        row["source_quality_score"] = doc.get("source_quality_score")
+                    rows.append(row)
+                continue
             row = {
                 "evidence_id": ids.mint(ctx.run_id, "EV", len(rows)),
                 "run_id": ctx.run_id,
@@ -230,6 +261,7 @@ class ClaimLiteBuildOperator(Operator):
                 "status": "accepted",      # accepted iff a supporting evidence row exists (added below)
                 "confidence": "supported_by_source",
                 "limitations": [],
+                "proposed_by": None,
                 "derivation": None,
             })
             links.append({"claim_id": claim_id, "evidence_id": ev["evidence_id"], "role": "supporting"})
@@ -271,10 +303,10 @@ class MetricSynthesisOperator(Operator):
             doc = docs.get(ev["document_id"])
             if (doc and doc.get("document_kind") == "github_document"
                     and ev.get("quoted_text", "").startswith("Repository metrics")):
-                metric_evidence[ev["document_id"]] = ev
+                metric_evidence.setdefault(ev["document_id"], {})[_metric_name(ev)] = ev
 
         repos = []
-        for doc_id, ev in metric_evidence.items():
+        for doc_id, ev_by_metric in metric_evidence.items():
             doc = docs[doc_id]
             item = items.get(doc["selected_item_id"])
             metadata = doc.get("provider_metadata") if isinstance(doc.get("provider_metadata"), dict) else {}
@@ -283,7 +315,8 @@ class MetricSynthesisOperator(Operator):
             repos.append({
                 "doc": doc,
                 "item": item,
-                "evidence": ev,
+                "stars_evidence": ev_by_metric.get("stars"),
+                "releases_evidence": ev_by_metric.get("releases_in_window"),
                 "label": _repo_label(item, doc),
                 "stars": _numeric(metadata.get("stars")),
                 "releases": _numeric(metadata.get("releases_in_window")),
@@ -296,15 +329,21 @@ class MetricSynthesisOperator(Operator):
 
         star_repos = [repo for repo in repos if repo["stars"] is not None]
         star_repos.sort(key=lambda repo: (-float(repo["stars"]), repo["label"]))
-        if len(star_repos) >= 2 and float(star_repos[1]["stars"]) != 0:
-            top, runner_up = star_repos[0], star_repos[1]
+        top = runner_up = None
+        if len(star_repos) >= 2:
+            candidate_top, candidate_runner_up = star_repos[0], star_repos[1]
+            if (candidate_top["stars_evidence"] is not None
+                    and candidate_runner_up["stars_evidence"] is not None
+                    and float(candidate_runner_up["stars"]) != 0):
+                top, runner_up = candidate_top, candidate_runner_up
+        if top is not None and runner_up is not None:
             ratio = round(float(top["stars"]) / float(runner_up["stars"]), 2)
             claim_id = ids.mint(ctx.run_id, "CLAIM", len(claims))
             derivation = {
                 "method": "star_ratio",
                 "inputs": [
-                    {"evidence_id": top["evidence"]["evidence_id"], "label": top["label"], "value": top["stars"]},
-                    {"evidence_id": runner_up["evidence"]["evidence_id"], "label": runner_up["label"],
+                    {"evidence_id": top["stars_evidence"]["evidence_id"], "label": top["label"], "value": top["stars"]},
+                    {"evidence_id": runner_up["stars_evidence"]["evidence_id"], "label": runner_up["label"],
                      "value": runner_up["stars"]},
                 ],
                 "computed": {"ratio": ratio},
@@ -321,6 +360,7 @@ class MetricSynthesisOperator(Operator):
                 "status": "accepted",
                 "confidence": "computed_from_metrics",
                 "limitations": [],
+                "proposed_by": "metric_synthesis",
                 "derivation": derivation,
             })
             for inp in derivation["inputs"]:
@@ -334,12 +374,12 @@ class MetricSynthesisOperator(Operator):
             comparison_claims += 1
 
         for repo in repos:
-            if repo["releases"] is None:
+            if repo["releases"] is None or repo["releases_evidence"] is None:
                 continue
             claim_id = ids.mint(ctx.run_id, "CLAIM", len(claims))
             derivation = {
                 "method": "release_count",
-                "inputs": [{"evidence_id": repo["evidence"]["evidence_id"], "label": repo["label"],
+                "inputs": [{"evidence_id": repo["releases_evidence"]["evidence_id"], "label": repo["label"],
                             "value": repo["releases"]}],
                 "computed": {"count": repo["releases"]},
             }
@@ -354,9 +394,10 @@ class MetricSynthesisOperator(Operator):
                 "status": "accepted",
                 "confidence": "computed_from_metrics",
                 "limitations": [],
+                "proposed_by": "metric_synthesis",
                 "derivation": derivation,
             })
-            links.append({"claim_id": claim_id, "evidence_id": repo["evidence"]["evidence_id"], "role": "supporting"})
+            links.append({"claim_id": claim_id, "evidence_id": repo["releases_evidence"]["evidence_id"], "role": "supporting"})
             trend_claims += 1
 
         work.write_rows("claims", claims)

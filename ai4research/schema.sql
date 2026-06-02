@@ -80,6 +80,7 @@ CREATE TABLE domain_packs (
   scoring_weights TEXT NOT NULL,
   required_sections TEXT NOT NULL,
   required_gates TEXT NOT NULL,
+  llm_operators TEXT NOT NULL,
   question_template TEXT NOT NULL
 );
 
@@ -197,6 +198,7 @@ CREATE TABLE evidence (
   support_strength TEXT,
   limitations      TEXT,                  -- JSON array
   published_at     TEXT,
+  metric_value     REAL,
   source_quality_score REAL
 );
 
@@ -211,6 +213,7 @@ CREATE TABLE claims (
   status       TEXT NOT NULL,             -- draft | accepted | qualified | rejected
   confidence   TEXT,
   limitations  TEXT,                      -- JSON array
+  proposed_by  TEXT,                      -- metric_synthesis | llm_synthesis | null
   derivation   TEXT                       -- JSON: {method, inputs, computed}
 );
 CREATE TABLE claim_evidence (

@@ -36,6 +36,7 @@ DOMAIN_PACKS: dict[str, dict] = {
         "scoring_weights": {},
         "required_sections": _SECTION_HEADINGS,
         "required_gates": list(_BASE_GATES),
+        "llm_operators": [],
         "question_template": [{"id": "Q0", "type": "root_question", "text": "<topic>"}],
     },
     "youtube_github_research": {
@@ -53,6 +54,7 @@ DOMAIN_PACKS: dict[str, dict] = {
         "scoring_weights": {"github_stars_full_scale": 10000},
         "required_sections": _SECTION_HEADINGS,
         "required_gates": list(_BASE_GATES) + ["QuestionCoverageGate"],
+        "llm_operators": ["LLMSynthesisOperator"],
         "question_template": [
             {"id": "Q0", "type": "root_question", "text": "<topic>"},
             {"id": "Q1", "type": "sub_question", "text": "Which repositories are most active?"},
@@ -82,6 +84,7 @@ def pack_rows() -> list[dict]:
             "scoring_weights": pack["scoring_weights"],
             "required_sections": pack["required_sections"],
             "required_gates": pack["required_gates"],
+            "llm_operators": pack.get("llm_operators", []),
             "question_template": pack["question_template"],
         }
         for pack in DOMAIN_PACKS.values()
