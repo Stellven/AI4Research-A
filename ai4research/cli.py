@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -70,7 +72,28 @@ def cmd_demo(args: argparse.Namespace) -> int:
     if result.status == "failed":
         rc = 1
     _print_summary(ctx, result, work)
+    if args.copy_to and result.report_path:
+        stem = f"{_slug(args.topic)}__{ctx.run_id}"   # unique per run -> never clobbers a prior copy
+        _copy_report(Path(result.report_path), Path(args.copy_to).expanduser(), stem)
     return rc
+
+
+def _slug(text: str) -> str:
+    return (re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")[:48]) or "report"
+
+
+def _copy_report(report_path: Path, dest_dir: Path, stem: str) -> None:
+    """Copy the finalized report (rendered .html + its .md source) into `dest_dir` under a
+    unique, identifiable name (topic slug + run id), so e.g. a Windows Downloads folder
+    accumulates one file per run instead of overwriting a fixed `report.html`."""
+    s = Style()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for suffix in (".html", ".md"):          # report_path is the .md; copy both rendered siblings
+        src = report_path.with_suffix(suffix)
+        if src.exists():
+            dest = dest_dir / f"{stem}{suffix}"
+            shutil.copy2(src, dest)
+            print(f"  {s('copied'.ljust(10), 'dim')}{dest}")
 
 
 def _banner(s: Style) -> str:
@@ -141,6 +164,8 @@ def main(argv: list[str] | None = None) -> int:
     demo.add_argument("--max-per-container", type=int, default=None)
     demo.add_argument("--domain-pack", default=None)
     demo.add_argument("--model-runtime", default=None, choices=["stub", "codex"])
+    demo.add_argument("--copy-to", default=None,
+                      help="copy the finalized report (.html + .md) into this directory after the run")
     demo.set_defaults(func=cmd_demo)
 
     args = parser.parse_args(argv)
