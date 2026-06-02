@@ -511,8 +511,11 @@ def _citation_url(locator: dict, doc: dict, span: dict) -> str | None:
         return None
     if doc.get("document_kind") == "github_document":
         normalized = doc.get("normalized_text") or ""
-        start_line = 1 + normalized[:span["start_char"]].count("\n")
-        end_line = 1 + normalized[:span["end_char"]].count("\n")
+        # the synthetic metrics block is prepended to the README (DocumentNormalizeOperator), so
+        # line numbers in normalized_text are shifted; subtract its lines to point at the real README.
+        offset = _github_metrics_block(doc.get("provider_metadata")).count("\n")
+        start_line = max(1, 1 + normalized[:span["start_char"]].count("\n") - offset)
+        end_line = max(1, 1 + normalized[:span["end_char"]].count("\n") - offset)
         return f"{base_url}#L{start_line}-L{end_line}"
     if doc.get("document_kind") == "youtube_transcript":
         seconds = _youtube_seconds_for_span(doc.get("provider_metadata"), span["start_char"])

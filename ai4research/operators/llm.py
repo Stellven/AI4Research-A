@@ -15,15 +15,26 @@ from ..runtime import RunContext
 from ..workfiles import WorkStore
 from .base import Operator
 
+# Object-wrapped (codex --output-schema requires a top-level object, strict): a {claims: [...]}
+# envelope. CodexRuntime returns the object; the stub may return a bare list of claim records —
+# both are handled in run().
 PROPOSAL_SCHEMA = {
-    "type": "array",
-    "items": {
-        "type": "object",
-        "required": ["claim_text", "cited_evidence_ids"],
-        "properties": {
-            "claim_text": {"type": "string"},
-            "claim_type": {"type": "string"},
-            "cited_evidence_ids": {"type": "array", "items": {"type": "string"}},
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["claims"],
+    "properties": {
+        "claims": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["claim_text", "claim_type", "cited_evidence_ids"],
+                "properties": {
+                    "claim_text": {"type": "string"},
+                    "claim_type": {"type": "string"},
+                    "cited_evidence_ids": {"type": "array", "items": {"type": "string"}},
+                },
+            },
         },
     },
 }
@@ -62,10 +73,13 @@ class LLMSynthesisOperator(Operator):
             return {"enabled": 1, "runtime": runtime_name, "runtime_status": "failed", "error": str(exc),
                     "proposed": 0, "dropped": 0}
 
+        # codex returns the {claims: [...]} envelope; a stub may return a bare list of records.
+        proposals = records[0]["claims"] if (len(records) == 1 and isinstance(records[0].get("claims"), list)) else records
+
         claims = work.read_rows("claims")
         links = work.read_rows("claim_evidence")
         proposed = dropped = 0
-        for record in records:
+        for record in proposals:
             cited = [eid for eid in record.get("cited_evidence_ids", []) if isinstance(eid, str)]
             if not cited or any(eid not in evidence for eid in cited):
                 dropped += 1

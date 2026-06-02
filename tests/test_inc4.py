@@ -228,6 +228,15 @@ class AnswerSynthesisTest(unittest.TestCase):
             self.assertNotIn("EV9999", md)            # invented ref never rendered
             self.assertNotIn("unsupported claim", md)  # ungrounded finding dropped
             self.assertNotIn("Ungrounded angle", md)   # ungrounded section dropped
+            from ai4research import store
+            conn = store.connect(ctx.db_path)
+            try:
+                row = conn.execute("SELECT summary, key_findings FROM answer WHERE run_id=?",
+                                   (ctx.run_id,)).fetchone()
+            finally:
+                conn.close()
+            self.assertIsNotNone(row)                   # the dossier is persisted (audit #3)
+            self.assertTrue(json.loads(row[1]))         # key_findings round-trips as JSON
 
 
 class QuestionGraphDerivationTest(unittest.TestCase):

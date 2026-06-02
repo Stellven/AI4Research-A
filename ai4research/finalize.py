@@ -53,7 +53,8 @@ def finalize(ctx: RunContext, work: WorkStore) -> FinalizeResult:
     report_name = "diagnostic_report.md" if relabeled else ("final_report.md" if approved else "diagnostic_report.md")
     report_path = ctx.exports_dir / report_name
     html_path = ctx.exports_dir / report_name.replace(".md", ".html")
-    exports_ok = report_path.exists() and report_path.stat().st_size > 0 and html_path.exists()
+    exports_ok = (report_path.exists() and report_path.stat().st_size > 0
+                  and html_path.exists() and html_path.stat().st_size > 0)
 
     if not persisted:
         status, issues = "failed", [f"persist failed: {persist_error}"]

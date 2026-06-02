@@ -308,6 +308,21 @@ CREATE TABLE quality_dossier (
   grounding_level              TEXT NOT NULL DEFAULT 'traceable' -- traceable|entailment_checked
 );
 
+-- The synthesized dossier (Increment 5): the report's headline output, made durable + queryable.
+CREATE TABLE answer (
+  run_id             TEXT PRIMARY KEY REFERENCES runs(run_id),
+  summary            TEXT,              -- synthesized overview (the centrepiece)
+  key_findings       TEXT,              -- JSON: [{finding, evidence_ids, confidence}]
+  sections           TEXT,              -- JSON: [{title, body}]
+  outlook            TEXT,              -- JSON: [str]
+  caveats            TEXT,              -- JSON: [str]
+  open_questions     TEXT,              -- JSON: [str]
+  source             TEXT,              -- runtime that produced it (e.g. codex)
+  sources_count      INTEGER,
+  citations_kept     INTEGER,
+  citations_dropped  INTEGER
+);
+
 CREATE TABLE repair_tasks (
   task_id     TEXT PRIMARY KEY,
   run_id      TEXT NOT NULL REFERENCES runs(run_id),

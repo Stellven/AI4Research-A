@@ -34,6 +34,7 @@ JSON_COLS: dict[str, set[str]] = {
     "gate_results": {"checked_tables", "issues", "metrics"},
     "quality_dossier": {"coverage"},
     "operator_invocations": {"metrics"},
+    "answer": {"key_findings", "sections", "outlook", "caveats", "open_questions"},
 }
 
 # FK-safe load order: parents before children. `documents` is read from per-doc JSON.
@@ -44,7 +45,7 @@ _PERSIST_ORDER: list[str] = [
     "source_containers", "selected_source_items", "acquisition_attempts", "documents",
     "spans", "evidence", "claims", "entities", "claim_entities", "claim_evidence", "claim_edges", "citations",
     "report_sections", "figures", "section_claims", "section_citations",
-    "gate_results", "quality_dossier", "repair_tasks", "operator_invocations", "artifact_exports",
+    "gate_results", "quality_dossier", "answer", "repair_tasks", "operator_invocations", "artifact_exports",
 ]
 
 # Global registry (PK not run-scoped); the same operators recur every run, so upsert.

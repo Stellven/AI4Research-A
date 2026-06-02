@@ -40,6 +40,9 @@ def stage_source_pack(pack_path: Path, dest: Path) -> None:
 
 
 def cmd_demo(args: argparse.Namespace) -> int:
+    if args.max_per_container is not None and args.max_per_container < 1:
+        print("--max-per-container must be >= 1", file=sys.stderr)
+        return 2
     runs_dir = Path(args.runs_dir).resolve()
     ctx = RunContext(ids.new_run_id(), runs_dir)
     ctx.ensure_dirs()

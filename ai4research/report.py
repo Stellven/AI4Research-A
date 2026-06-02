@@ -135,13 +135,20 @@ def _cites(evidence_ids: list, d: ReportData) -> str:
     return " ".join(parts)
 
 
+def _cell(value) -> str:
+    """Sanitize a value for a Markdown table cell: collapse newlines and neutralize `|`, which
+    source text (e.g. a README that itself contains a Markdown table) would otherwise use to
+    split the row into spurious columns."""
+    return str(value).replace("\n", " ").replace("|", "¦")
+
+
 def _coverage(d: ReportData) -> list[str]:
     out = ["## Source And Acquisition Coverage", "",
            "| Container | Type | Item | Acquisition |", "| --- | --- | --- | --- |"]
     status_by_item = {a["selected_item_id"]: a for a in d.attempts}
     for c in d.containers:
         items = [i for i in d.items if i["container_id"] == c["container_id"]]
-        label = c.get("label") or c["container_id"]
+        label = _cell(c.get("label") or c["container_id"])
         if not items:
             out.append(f"| {label} | {c['source_pack_type']} | _(no items — coverage gap)_ | — |")
         for i in items:
@@ -149,7 +156,7 @@ def _coverage(d: ReportData) -> list[str]:
             verdict = att.get("status", "pending")
             if att.get("failure_code"):
                 verdict += f" ({att['failure_code']})"
-            out.append(f"| {label} | {c['source_pack_type']} | {i.get('title') or i['selected_item_id']} | {verdict} |")
+            out.append(f"| {label} | {c['source_pack_type']} | {_cell(i.get('title') or i['selected_item_id'])} | {verdict} |")
     out.append("")
     return out
 
@@ -185,10 +192,10 @@ def _evidence_table(d: ReportData) -> list[str]:
         cite = d.cite_by_evidence.get(ev["evidence_id"])
         label = cite["label"] if cite else "—"
         item = d.by_item.get(ev["selected_item_id"], {})
-        excerpt = ev["quoted_text"].strip().replace("\n", " ")
+        excerpt = _cell(ev["quoted_text"].strip())
         if len(excerpt) > 160:
             excerpt = excerpt[:157] + "..."
-        out.append(f"| {label} | {item.get('title') or ev['selected_item_id']} "
+        out.append(f"| {label} | {_cell(item.get('title') or ev['selected_item_id'])} "
                    f"| {ev['evidence_type']} | {excerpt} |")
     out.append("")
     return out
@@ -519,5 +526,16 @@ def _html_table(rows: list[str]) -> str:
 def _inline(s: str) -> str:
     s = _html.escape(s)
     s = s.replace("**", "")  # drop bold markers; minimal renderer
-    s = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', s)
+    s = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", _safe_anchor, s)
     return s.replace("`", "")
+
+
+def _safe_anchor(match: "re.Match") -> str:
+    """Render a markdown link only for safe schemes — http/https or relative. Source text
+    (READMEs, transcripts) is untrusted, so a `[x](javascript:…)` / `data:` link must not become
+    an active anchor in the HTML report (XSS); drop the link, keep the label."""
+    label, url = match.group(1), match.group(2)
+    low = url.strip().lower()
+    if low.startswith(("http://", "https://")) or not re.match(r"[a-z][a-z0-9+.-]*:", low):
+        return f'<a href="{url}">{label}</a>'
+    return label

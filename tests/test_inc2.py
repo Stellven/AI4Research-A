@@ -170,14 +170,23 @@ class Increment2Test(unittest.TestCase):
         self.assertEqual(G.gate_schema_validation({"evidence": evidence}, {})["status"], G.PASS)
 
     def test_github_deep_link_uses_span_lines(self):
+        from ai4research.operators.extraction import _github_metrics_block
         with tempfile.TemporaryDirectory() as tmp:
             _, work, _ = _run_domain(tmp, [_github_container()], {"domain_pack": "youtube_github_research"})
-            citation = next(c for c in work.read_rows("citations") if c["url"])
-            span = next(s for s in work.read_rows("spans") if s["span_id"] == citation["span_id"])
-            doc = next(d for d in work.read_documents() if d["document_id"] == citation["document_id"])
-            start_line = 1 + doc["normalized_text"][:span["start_char"]].count("\n")
-            end_line = 1 + doc["normalized_text"][:span["end_char"]].count("\n")
-            self.assertTrue(citation["url"].endswith(f"#L{start_line}-L{end_line}"))
+            spans = {s["span_id"]: s for s in work.read_rows("spans")}
+            doc = work.read_documents()[0]
+            # the synthetic metrics block is prepended to the README; the #L anchor must subtract
+            # its lines so it points at the real README, not a shifted line (audit finding).
+            offset = _github_metrics_block(doc.get("provider_metadata")).count("\n")
+            self.assertGreater(offset, 0)   # this fixture carries metrics -> a block is prepended
+            cite = max((c for c in work.read_rows("citations") if c["url"] and "#L" in c["url"]),
+                       key=lambda c: spans[c["span_id"]]["start_char"])   # deepest README span
+            span = spans[cite["span_id"]]
+            naive = 1 + doc["normalized_text"][:span["start_char"]].count("\n")
+            start_line = max(1, naive - offset)
+            end_line = max(1, 1 + doc["normalized_text"][:span["end_char"]].count("\n") - offset)
+            self.assertTrue(cite["url"].endswith(f"#L{start_line}-L{end_line}"))
+            self.assertLess(start_line, naive)   # the prepended block was accounted for
 
     def test_youtube_timestamp_deep_link_and_plain_txt_degrade(self):
         with tempfile.TemporaryDirectory() as tmp:

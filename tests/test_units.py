@@ -231,5 +231,31 @@ class PlanPipelineTest(unittest.TestCase):
         self.assertIn("deterministic_core", det["reason"])    # no runtime -> deterministic plan
 
 
+class AuditHardeningTest(unittest.TestCase):
+    """Smaller correctness fixes from the external audit."""
+
+    def test_max_per_container_rejects_non_positive(self):
+        from ai4research.cli import main as cli_main
+        rc = cli_main(["demo", "--topic", "t", "--source-pack", "/no/such.jsonl", "--max-per-container", "-1"])
+        self.assertEqual(rc, 2)   # validated and rejected before staging
+
+    def test_table_cell_neutralizes_pipes_and_newlines(self):
+        from ai4research.report import _cell
+        self.assertNotIn("|", _cell("a | b\nc"))   # source pipes can't split the row
+        self.assertNotIn("\n", _cell("a\nb"))
+
+
+class InlineLinkSafetyTest(unittest.TestCase):
+    """The HTML renderer must not turn unsafe-scheme markdown links from untrusted source text
+    into active anchors (XSS). Audit finding."""
+
+    def test_blocks_unsafe_schemes_allows_http_and_relative(self):
+        from ai4research.report import _inline
+        self.assertNotIn("<a", _inline("[x](javascript:alert(1))"))   # dropped, label kept
+        self.assertNotIn("<a", _inline("[x](data:text/html,evil)"))
+        self.assertIn('<a href="https://example.com">y</a>', _inline("[y](https://example.com)"))
+        self.assertIn("<a href=", _inline("[z](docs/readme.md)"))     # relative allowed
+
+
 if __name__ == "__main__":
     unittest.main()
