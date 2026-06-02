@@ -45,14 +45,23 @@ def _github_container(stars=1250, with_metrics=True) -> dict:
 
 def _timed_youtube_container(tmp: str) -> dict:
     fixture = Path(tmp) / "timed_transcript.json"
-    fixture.write_text(json.dumps([
-        {"start": 5, "text": "Short intro."},
-        {"start": 42, "text": (
-            "The channel says skills taxonomy governance should be auditable, reviewed by "
-            "practitioners, and connected to verifiable evidence so competency framework "
-            "claims remain trustworthy."
-        )},
-    ]), encoding="utf-8")
+    # Real captions are short per-line snippets, each well under the 80-char evidence floor.
+    # The adapter must coalesce them into paragraph-sized spans (otherwise a whole transcript
+    # yields no evidence) while preserving each line's timestamp for the &t= deep link.
+    lines = [
+        "skills taxonomy governance should remain fully auditable",
+        "and be reviewed by practitioners across the whole team",
+        "every competency framework claim must cite real evidence",
+        "so the published catalog of skills stays trustworthy over time",
+        "teams version the taxonomy and record each change carefully",
+        "reviewers sign off before any new skill becomes published",
+        "deprecating an existing skill follows the same review path",
+        "automation can propose updates from observed daily work",
+        "but a human approves every single promotion decision made",
+        "metrics track how often each skill is exercised in practice",
+    ]
+    fixture.write_text(json.dumps(
+        [{"start": i * 8, "text": t} for i, t in enumerate(lines)]), encoding="utf-8")
     return {
         "container_id": "C-YT-TIMED", "source_pack_type": "youtube_channel",
         "label": "Timed Channel",
@@ -63,6 +72,19 @@ def _timed_youtube_container(tmp: str) -> dict:
                 "url": "https://www.youtube.com/watch?v=timed",
                 "local_fixture_path": str(fixture),
             },
+        }],
+    }
+
+
+def _youtube_container_from_captions(tmp: str, raw: list, name: str = "caps") -> dict:
+    fixture = Path(tmp) / f"{name}.json"
+    fixture.write_text(json.dumps(raw), encoding="utf-8")
+    return {
+        "container_id": f"C-YT-{name}", "source_pack_type": "youtube_channel", "label": "Channel",
+        "items": [{
+            "item_id": f"I-YT-{name}", "title": "transcript",
+            "item_locator": {"url": f"https://www.youtube.com/watch?v={name}",
+                             "local_fixture_path": str(fixture)},
         }],
     }
 
@@ -161,13 +183,57 @@ class Increment2Test(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _, work, _ = _run_domain(tmp, [_timed_youtube_container(tmp)], {"domain_pack": "youtube_github_research"})
             urls = [c["url"] for c in work.read_rows("citations") if c["url"]]
-            self.assertTrue(any("&t=42s" in url for url in urls))
+            ts_urls = [u for u in urls if "&t=" in u]
+            # short caption lines used to fall under the evidence floor and yield nothing;
+            # coalescing must now produce evidence-backed, timestamped citations
+            self.assertTrue(ts_urls)
+            caption_starts = {i * 8 for i in range(10)}
+            seconds = {int(re.search(r"&t=(\d+)s", u).group(1)) for u in ts_urls}
+            self.assertTrue(seconds <= caption_starts)   # every &t= lands on a real caption boundary
+            self.assertGreaterEqual(len(seconds), 2)     # coalesced into multiple precisely-timed spans
 
         with tempfile.TemporaryDirectory() as tmp:
             _, work, _ = _run_domain(tmp, [support.youtube_container()], {"domain_pack": "youtube_github_research"})
             urls = [c["url"] for c in work.read_rows("citations") if c["url"]]
             self.assertTrue(urls)
             self.assertTrue(all("&t=" not in url for url in urls))
+
+    def test_youtube_timestamp_is_exact_when_captions_have_interior_newlines(self):
+        # Real captions carry interior newlines / trailing whitespace before them, which
+        # normalize() deletes. start_char must index the NORMALIZED text so &t= maps to the
+        # exact caption; recording pre-normalize offsets drifts the timestamp to an earlier one.
+        raw = [{"start": i * 8,
+                "text": (f"governance point number {i} concerns auditable competency frameworks   \n"
+                         "and the practitioner review that keeps the published skills catalog honest")}
+               for i in range(12)]
+        with tempfile.TemporaryDirectory() as tmp:
+            _, work, result = _run_domain(tmp, [_youtube_container_from_captions(tmp, raw)],
+                                          {"domain_pack": "youtube_github_research"})
+            self.assertEqual(result.status, "finalized")
+            spans = {s["span_id"]: s for s in work.read_rows("spans")}
+            cleaned = {seg["start"]: " ".join(seg["text"].split()) for seg in raw}
+            ts = [(c, spans[c["span_id"]]) for c in work.read_rows("citations") if c["url"] and "&t=" in c["url"]]
+            self.assertTrue(ts)
+            for cite, span in ts:
+                secs = int(re.search(r"&t=(\d+)s", cite["url"]).group(1))
+                # the cited passage must BEGIN with the caption its &t= points to (exact mapping)
+                self.assertTrue(span["text"].startswith(cleaned[secs]),
+                                f"&t={secs}s but span starts {span['text'][:50]!r}")
+
+    def test_short_trailing_caption_is_not_dropped_below_the_evidence_floor(self):
+        # A short caption stranded just past a paragraph-flush boundary must merge into the
+        # previous paragraph, not become a lone sub-floor span silently dropped from the report.
+        tail = "and this final closing remark still matters to the whole audience"
+        raw = ([{"start": i * 5,
+                 "text": "skills governance reviewers audit every published competency claim with care"}
+                for i in range(6)]
+               + [{"start": 99, "text": tail}])
+        with tempfile.TemporaryDirectory() as tmp:
+            _, work, result = _run_domain(tmp, [_youtube_container_from_captions(tmp, raw, "tail")],
+                                          {"domain_pack": "youtube_github_research"})
+            self.assertEqual(result.status, "finalized")
+            evidence_text = " ".join(e["quoted_text"] for e in work.read_rows("evidence"))
+            self.assertIn(tail, evidence_text)
 
     def test_question_coverage_warning_records_coverage_and_remains_nonblocking(self):
         with tempfile.TemporaryDirectory() as tmp:
