@@ -220,11 +220,14 @@ def _findings(d: ReportData, *, as_appendix: bool = False) -> list[str]:
 
 
 def _contradictions(d: ReportData) -> list[str]:
-    """#22/9: cross-source disputes + rejected/qualified claims, straight from the claim graph. A
-    counter-search writes evidence -> claim `refutes`/`qualifies` edges; each is rendered as the
-    claim *disputed by* counter-evidence from another source. Returns [] when the graph holds none,
-    so a no-runtime run — which can produce neither — stays byte-identical."""
+    """#22/9/11: cross-source disagreement + rejected/qualified claims, straight from the claim
+    graph. Inc 11 writes claim<->claim disagreement edges (from_id is a claim) rendered as "A
+    disagrees with B"; the older counter-search writes claim<->evidence edges (from_id is evidence)
+    rendered as the claim *disputed by* counter-evidence. Returns [] when the graph holds none, so a
+    no-runtime run — which can produce neither — stays byte-identical."""
     edges = [e for e in d.claim_edges if e.get("type") in ("refutes", "qualifies")]
+    pair_edges = [e for e in edges if e.get("from_id") in d.by_claim]        # claim <-> claim (Inc 11)
+    ev_edges = [e for e in edges if e.get("from_id") not in d.by_claim]      # evidence <-> claim (#22)
 
     def _review_reason(c):   # the marker only the contradiction reviewer writes — NOT EntailmentGate
         for x in (c.get("limitations") or []):
@@ -238,6 +241,18 @@ def _contradictions(d: ReportData) -> list[str]:
     if not edges and not flagged:
         return []
 
+    def _clip(text):
+        text = (text or "").strip().replace("\n", " ")
+        return text[:140] + ("…" if len(text) > 140 else "")
+
+    def _pair_bullet(e):                                       # claim <-> claim, both stay accepted
+        a, b = e["from_id"], e["to_id"]
+        sa = d.container_label.get(d.container_by_claim.get(a), "one source")
+        sb = d.container_label.get(d.container_by_claim.get(b), "another source")
+        verb = "disagrees with" if e["type"] == "refutes" else "qualifies"
+        return (f"- _{_clip(d.by_claim.get(a, {}).get('claim_text', a))}_ ({sa}) — "
+                f"**{verb}** — _{_clip(d.by_claim.get(b, {}).get('claim_text', b))}_ ({sb})")
+
     def _dispute_bullet(e):
         claim_id, ev_id = e["to_id"], e["from_id"]              # evidence -> claim edge
         claim_text = d.by_claim.get(claim_id, {}).get("claim_text", claim_id)
@@ -250,8 +265,9 @@ def _contradictions(d: ReportData) -> list[str]:
         return f"- _{claim_text}_ — **{verb}** {src}: {summ}{link}"
 
     out = ["## Contradictions & rejected claims", ""]
-    if edges:                                  # all cross-source by construction (the counter-search)
-        out += ["### Where sources disagree", ""] + [_dispute_bullet(e) for e in edges] + [""]
+    if pair_edges or ev_edges:                 # all cross-source by construction
+        out += ["### Where sources disagree", ""]
+        out += [_pair_bullet(e) for e in pair_edges] + [_dispute_bullet(e) for e in ev_edges] + [""]
     if flagged:
         out += ["### Rejected / qualified claims", ""]
         for c in flagged:
@@ -323,11 +339,11 @@ def _key_concepts(d: ReportData) -> list[str]:
                     key=lambda r: (-r[1], -r[2]))
     if not ranked:
         return []
-    contested = sum(1 for _, nsrc, _ in ranked if nsrc >= 2)
+    cross_source = sum(1 for _, nsrc, _ in ranked if nsrc >= 2)
     out = ["## Key concepts", "",
-           f"The concepts this topic turns on — {len(ranked)} derived from the claims, {contested} "
-           "**contested** (engaged by ≥2 independent sources, where cross-source disagreement lives). "
-           "⚑ marks a contested concept.", ""]
+           f"The concepts this topic turns on — {len(ranked)} derived from the claims, {cross_source} "
+           "**cross-source** (engaged by ≥2 independent sources). ⚑ marks a cross-source concept — see "
+           "*Where sources disagree* for the concepts sources actually conflict on.", ""]
     for eid, nsrc, nclaims in ranked[:_CONCEPT_CAP]:
         e = ent[eid]
         flag = "⚑ " if nsrc >= 2 else ""

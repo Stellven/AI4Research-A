@@ -586,8 +586,26 @@ def _answer_prompt(topic: str, sub_questions: list[str], claims: list[dict],
 CONTRADICTION_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["disputes", "rejections"],
+    "required": ["disagreements", "disputes", "rejections"],
     "properties": {
+        # Inc 11 (bake-off winner S4): claim<->claim disagreement on a shared concept + axis.
+        "disagreements": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["claim_a", "claim_b", "concept", "axis", "relation", "reason"],
+                "properties": {
+                    "claim_a": {"type": "string"},
+                    "claim_b": {"type": "string"},
+                    "concept": {"type": "string"},
+                    "axis": {"type": "string"},
+                    "relation": {"type": "string", "enum": ["refutes", "qualifies"]},
+                    "reason": {"type": "string"},
+                },
+            },
+        },
+        # The pre-existing claim<->evidence counter-search (kept as a fallback; #22).
         "disputes": {
             "type": "array",
             "items": {
@@ -681,6 +699,60 @@ def _contested_claims(work: WorkStore, claim_container: dict, accepted: set) -> 
     return {cid for cid, ents in claim_ents.items() if ents & contested_ents}
 
 
+def _contested_concepts(work: WorkStore, claim_container: dict, accepted: set) -> dict:
+    """Inc 11: {concept_name: [claim_ids]} for concepts (entities) engaged by accepted claims from
+    >=2 source containers — the concepts to look for cross-source disagreement WITHIN. Reuses the
+    backfilled claim_entities; empty without an ontology so the claim-pair pass is simply skipped."""
+    name_of = {e["entity_id"]: e.get("canonical_name") for e in work.read_rows("entities")}
+    ent_claims: dict = {}
+    ent_containers: dict = {}
+    for link in work.read_rows("claim_entities"):
+        cid, eid = link.get("claim_id"), link.get("entity_id")
+        if cid not in accepted:
+            continue
+        ent_claims.setdefault(eid, []).append(cid)
+        cont = claim_container.get(cid)
+        if cont:
+            ent_containers.setdefault(eid, set()).add(cont)
+    groups: dict = {}
+    for eid, cids in ent_claims.items():
+        if len(ent_containers.get(eid, ())) >= 2 and name_of.get(eid):
+            seen: list = []
+            for c in cids:                       # dedup, preserve order
+                if c not in seen:
+                    seen.append(c)
+            groups[name_of[eid]] = seen
+    return groups
+
+
+def _validate_disagreements(items, accepted: set, claim_container: dict, seen: set, run_id: str) -> tuple:
+    """Inc 11: validate proposed claim<->claim disagreements and return (edges, axes). A disagreement
+    is kept only if claim_a and claim_b are DISTINCT ACCEPTED claims from DIFFERENT sources, the
+    relation is refutes|qualifies, and the pair (either direction) is not already an edge. Both
+    claims stay accepted — the edge records the disagreement (canon C2). `seen` is mutated to dedup."""
+    edges: list = []
+    axes: set = set()
+    for item in (items or []):
+        if not isinstance(item, dict):
+            continue
+        a, b, rel = item.get("claim_a"), item.get("claim_b"), item.get("relation")
+        if not (isinstance(a, str) and isinstance(b, str) and isinstance(rel, str)):
+            continue
+        if rel not in ("refutes", "qualifies") or a == b or a not in accepted or b not in accepted:
+            continue
+        ca, cb = claim_container.get(a), claim_container.get(b)
+        if not (ca and cb and ca != cb):                       # cross-source only
+            continue
+        if (a, b, rel) in seen or (b, a, rel) in seen:         # dedup incl. the reverse pair
+            continue
+        seen.add((a, b, rel))
+        edges.append({"run_id": run_id, "from_id": a, "to_id": b, "type": rel})
+        ax = item.get("axis")
+        if isinstance(ax, str) and ax.strip():
+            axes.add(ax.strip().lower())
+    return edges, axes
+
+
 def _anchor_claims(claims: list, accepted: set, claim_container: dict, contested: set | None = None) -> list:
     """The headline claims worth disputing: claims on CONTESTED entities first (cross-source
     disagreement lives there), then synthesized/comparative, then a source-balanced sample of
@@ -712,26 +784,42 @@ def _evidence_pool(evidence_rows: list, ev_container: dict, accepted_ev: set,
     return _round_robin(buckets, MAX_POOL)
 
 
+_MAX_CONCEPTS = 10              # concept groups shown for the claim-pair pass (bounds the prompt)
+_MAX_CLAIMS_PER_CONCEPT = 8
+
+
 def _contradiction_search_prompt(anchors: list, pool: list, claim_container: dict,
-                                 ev_container: dict, container_label: dict) -> str:
+                                 ev_container: dict, container_label: dict,
+                                 concept_groups: dict | None = None, claim_by_id: dict | None = None) -> str:
+    concept_groups = concept_groups or {}
+    claim_by_id = claim_by_id or {}
     lines = [
-        "You are a research reviewer running a COUNTER-SEARCH for cross-source disagreement. Below are "
-        "headline CLAIMS (each tagged with its source) and a pool of EVIDENCE from various sources. For "
-        "each claim, find EVIDENCE FROM A DIFFERENT SOURCE that CONTRADICTS it (gives the opposite "
-        "answer to the same question) or QUALIFIES it (limits/narrows it). Only pair a claim with "
-        "evidence whose source differs. Use the ids exactly as given — never invent ids.",
-        "",
-        "Seek SUBSTANTIVE disagreement about the SAME concept — e.g. one source says a method is "
+        "You are a research reviewer running a COUNTER-SEARCH for where SOURCES DISAGREE. Use ids "
+        "EXACTLY as given — never invent ids. Seek SUBSTANTIVE disagreement about the SAME concept: "
+        "one source says a method is "
         "comparable or superior while another shows it is weaker or fails on a specific task. Do NOT "
-        "treat the mere existence of a paper, repository, survey, or alternative method as a "
-        "contradiction; a bibliographic 'X also exists' is not a dispute.",
-        "",
-        "Return JSON: disputes [{claim_id, evidence_id, relation: \"contradicts\"|\"qualifies\", note}] "
-        "and rejections [{claim_id, reason}] (a claim to withdraw as unsupported — reject sparingly). "
-        "Leave an array empty if nothing applies.",
-        "",
-        "Claims:",
+        "treat the mere existence of a paper, repository, survey, or alternative as a disagreement.",
     ]
+    if concept_groups:
+        lines += [
+            "",
+            "(1) CLAIM-PAIR DISAGREEMENT (primary). Accepted claims are grouped by the CONCEPT they are "
+            "about. Within a concept, find PAIRS of claims FROM DIFFERENT SOURCES that disagree — one "
+            "refutes (opposite answer) or qualifies (limits/narrows) the other — and name the AXIS of "
+            "disagreement (e.g. efficiency, recall/copying, quality, fairness, cost, adoption). The two "
+            "claims must come from different sources.",
+            "",
+            "Concepts (pick disagreeing claim pairs from DIFFERENT sources):",
+        ]
+        for concept in list(concept_groups)[:_MAX_CONCEPTS]:
+            lines.append(f"Concept: {concept}")
+            for cid in concept_groups[concept][:_MAX_CLAIMS_PER_CONCEPT]:
+                src = container_label.get(claim_container.get(cid), "unknown source")
+                text = (claim_by_id.get(cid, {}).get("claim_text") or "").strip().replace("\n", " ")[:200]
+                lines.append(f"  - {cid} [source: {src}]: {text}")
+        lines += ["", "(2) COUNTER-EVIDENCE (fallback). For the headline claims below, find EVIDENCE "
+                  "FROM A DIFFERENT SOURCE that contradicts/qualifies the claim."]
+    lines += ["", "Claims:"]
     for c in anchors:
         src = container_label.get(claim_container.get(c["claim_id"]), "unknown source")
         text = (c.get("claim_text") or "").strip().replace("\n", " ")[:200]
@@ -741,6 +829,14 @@ def _contradiction_search_prompt(anchors: list, pool: list, claim_container: dic
         src = container_label.get(ev_container.get(e["evidence_id"]), "unknown source")
         summ = (e.get("summary") or e.get("quoted_text") or "").strip().replace("\n", " ")[:200]
         lines.append(f"- {e['evidence_id']} [source: {src}]: {summ}")
+    lines += [
+        "",
+        "Return JSON: disagreements [{claim_a, claim_b, concept, axis, relation: \"refutes\"|"
+        "\"qualifies\", reason}] (cross-source claim pairs), disputes [{claim_id, evidence_id, "
+        "relation: \"contradicts\"|\"qualifies\", axis, note}] (counter-evidence), rejections "
+        "[{claim_id, reason}] (withdraw an unsupported claim — sparingly). Leave arrays empty if "
+        "nothing applies.",
+    ]
     return "\n".join(lines)
 
 
@@ -794,9 +890,13 @@ class ContradictionDetectOperator(Operator):
                         if ce.get("role", "supporting") == "supporting" and ce.get("claim_id") in contested}
         anchors = _anchor_claims(claims, accepted, claim_container, contested)
         pool = _evidence_pool(evidence_rows, ev_container, accepted_ev, contested_ev)
+        # Inc 11: claims grouped by contested concept for the claim-pair disagreement pass.
+        claim_by_id = {c["claim_id"]: c for c in claims}
+        concept_groups = _contested_concepts(work, claim_container, accepted)
         try:
             records = runtime.propose(
-                _contradiction_search_prompt(anchors, pool, claim_container, ev_container, container_label),
+                _contradiction_search_prompt(anchors, pool, claim_container, ev_container,
+                                             container_label, concept_groups, claim_by_id),
                 CONTRADICTION_SCHEMA)
         except ModelRuntimeError as exc:
             return {"enabled": 1, "runtime": runtime_name, "runtime_status": "failed", "error": str(exc)}
@@ -837,6 +937,13 @@ class ContradictionDetectOperator(Operator):
                 qualifications += 1
                 qualified.add(cid)
 
+        # Inc 11: claim<->claim disagreement on a shared concept + axis (the bake-off winner). Both
+        # claims stay accepted (record-only contradiction, canon C2); the claim_a -> claim_b edge IS
+        # the disagreement, and AnswerSynthesis already reads claim->claim edges.
+        dis_edges, axes = _validate_disagreements(proposal.get("disagreements"), accepted, claim_container, seen, ctx.run_id)
+        new_edges.extend(dis_edges)
+        disagreements = len(dis_edges)
+
         # rejections — reason-gated, id-validated against the accepted snapshot (the shared #14 path)
         for item in (proposal.get("rejections") or []):
             if not isinstance(item, dict):
@@ -867,8 +974,10 @@ class ContradictionDetectOperator(Operator):
             "status": "warning" if rejections else "pass", "severity": "warning",
             "checked_tables": ["claims", "claim_edges", "evidence"],
             "issues": ([f"rejected {rejections} claim(s) on review"] if rejections else []),
-            "metrics": {"disputes": disputes, "qualifications": qualifications, "rejections": rejections,
-                        "anchors": len(anchors), "pool": len(pool), "contested": len(contested)},
+            "metrics": {"disagreements": disagreements, "axes": sorted(axes),
+                        "disputes": disputes, "qualifications": qualifications, "rejections": rejections,
+                        "anchors": len(anchors), "pool": len(pool), "contested": len(contested),
+                        "concepts": len(concept_groups)},
             "created_at": ids.utc_now_iso(),
         })
         # reconcile the persisted dossier (it post-dates the gate suite; mirror #27 Step 4) — both
@@ -881,8 +990,8 @@ class ContradictionDetectOperator(Operator):
             if not dossier.get("blocking_gate_failures"):
                 dossier["overall_status"] = "warning" if warnings else "pass"
             work.write_rows("quality_dossier", [dossier])
-        return {"enabled": 1, "runtime": runtime_name, "disputes": disputes,
-                "qualifications": qualifications, "rejections": rejections}
+        return {"enabled": 1, "runtime": runtime_name, "disagreements": disagreements,
+                "disputes": disputes, "qualifications": qualifications, "rejections": rejections}
 
 
 # --- Increment 7: codex critic pass (#14) -------------------------------------------------
