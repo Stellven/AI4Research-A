@@ -20,6 +20,7 @@ from .core import (
 )
 from .extraction import (
     CitationMapBuildOperator,
+    ClaimEntityBackfillOperator,
     ClaimLiteBuildOperator,
     DocumentNormalizeOperator,
     EntityTagOperator,
@@ -29,7 +30,13 @@ from .extraction import (
     SpanSegmentOperator,
 )
 from .gates import PreRenderQualityGateSuiteOperator
-from .llm import AnswerSynthesisOperator, LLMSynthesisOperator
+from .llm import (
+    AnswerSynthesisOperator,
+    ClaimCriticOperator,
+    ContradictionDetectOperator,
+    LLMSynthesisOperator,
+    OntologyDeriveOperator,
+)
 from .render import HtmlRenderOperator, MarkdownReportCompileOperator
 from .runner import OperatorRunner
 from .sources import (
@@ -54,10 +61,14 @@ def build_pipeline(model_runtime=None) -> list[Operator]:
         ClaimLiteBuildOperator(),
         MetricSynthesisOperator(),
         EntityTagOperator(),
+        OntologyDeriveOperator(model_runtime),
         LLMSynthesisOperator(model_runtime),
         CitationMapBuildOperator(),
         ReportBlueprintOperator(),
         PreRenderQualityGateSuiteOperator(),
+        ClaimEntityBackfillOperator(),
+        ContradictionDetectOperator(model_runtime),
+        ClaimCriticOperator(model_runtime),
         AnswerSynthesisOperator(model_runtime),
         MarkdownReportCompileOperator(),
         HtmlRenderOperator(),

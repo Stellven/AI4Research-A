@@ -60,7 +60,8 @@ def validate_plan(pipeline: list[Operator]) -> None:
         produced.update(op.OUTPUT_SCHEMAS)
 
 
-_LLM_OPERATORS = {"LLMSynthesisOperator", "AnswerSynthesisOperator"}
+_LLM_OPERATORS = {"OntologyDeriveOperator", "LLMSynthesisOperator", "ContradictionDetectOperator",
+                  "ClaimCriticOperator", "AnswerSynthesisOperator"}
 
 
 def plan_pipeline(pipeline: list[Operator], run_config: dict) -> tuple[list[str], dict]:
@@ -70,20 +71,31 @@ def plan_pipeline(pipeline: list[Operator], run_config: dict) -> tuple[list[str]
     the LLM operators, chosen when no model runtime is configured. Execution is unchanged — the LLM
     operators are inert without a runtime — but the decision is genuine, not 'no alternatives
     considered'. v2 will let the planner actually branch (conditionally include operators)."""
+    from ..domain_packs import get_pack   # lazy: domain_packs imports operators, avoid an import cycle
+
     validate_plan(pipeline)
     names = [op.NAME for op in pipeline]
     has_runtime = bool(run_config.get("model_runtime"))
-    llm_ops = [n for n in names if n in _LLM_OPERATORS]
-    selected = "llm_augmented" if has_runtime else "deterministic_core"
-    reason = (
-        f"Selected the {selected} plan: {len(names)} operators in dependency order. "
-        + (f"LLM operators {llm_ops} active (model_runtime={run_config.get('model_runtime')})."
-           if has_runtime
-           else f"No model_runtime configured — deterministic run; LLM operators {llm_ops} are inert.")
-    )
+    present = [n for n in names if n in _LLM_OPERATORS]
+    # Unified enablement: an LLM stage fires iff a runtime is configured AND the pack opts it into
+    # llm_operators. Name only the operators that will actually fire (so the recorded provenance is
+    # honest — e.g. the generic pack disables synthesis even when a runtime is configured).
+    pack_llm = set(get_pack(run_config.get("domain_pack")).get("llm_operators") or [])
+    active = [n for n in present if n in pack_llm] if has_runtime else []
+    if active:
+        reason = (f"Selected the llm_augmented plan: {len(names)} operators in dependency order. "
+                  f"LLM operators {active} active (model_runtime={run_config.get('model_runtime')}, "
+                  f"pack={run_config.get('domain_pack') or 'generic'}).")
+    elif has_runtime:
+        reason = (f"Selected the deterministic_core plan: {len(names)} operators in dependency order. "
+                  f"model_runtime={run_config.get('model_runtime')} but pack "
+                  f"{run_config.get('domain_pack') or 'generic'} opts in none of {present} — they are inert.")
+    else:
+        reason = (f"Selected the deterministic_core plan: {len(names)} operators in dependency order. "
+                  f"No model_runtime configured — deterministic run; LLM operators {present} are inert.")
     alternatives = [
-        f"deterministic_core: omit {llm_ops} (extractive + metric synthesis only)",
-        f"llm_augmented: include {llm_ops} for question-derivation + synthesis",
+        f"deterministic_core: omit {present} (extractive + metric synthesis only)",
+        f"llm_augmented: include the pack's LLM operators for question-derivation + synthesis",
     ]
     return names, {"reason": reason, "alternatives_considered": alternatives}
 

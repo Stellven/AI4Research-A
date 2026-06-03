@@ -223,12 +223,16 @@ class PlanPipelineTest(unittest.TestCase):
     def test_records_real_decision(self):
         from ai4research.operators.base import plan_pipeline
         pipe = build_pipeline()
-        names, dec = plan_pipeline(pipe, {"model_runtime": "codex"})
+        names, dec = plan_pipeline(pipe, {"model_runtime": "codex", "domain_pack": "youtube_github_research"})
         self.assertEqual(names, [op.NAME for op in pipe])     # v1: full pipeline, dependency order
         self.assertTrue(dec["alternatives_considered"])       # a real alternative, not []
         self.assertIn("llm_augmented", dec["reason"])
+        self.assertIn("AnswerSynthesisOperator", dec["reason"])   # names the operators that will fire
         _, det = plan_pipeline(pipe, {})
         self.assertIn("deterministic_core", det["reason"])    # no runtime -> deterministic plan
+        # runtime set but the pack opts in no LLM operators -> honestly still deterministic (S4)
+        _, generic = plan_pipeline(pipe, {"model_runtime": "codex", "domain_pack": "generic"})
+        self.assertIn("deterministic_core", generic["reason"])
 
 
 class AuditHardeningTest(unittest.TestCase):
@@ -255,6 +259,53 @@ class InlineLinkSafetyTest(unittest.TestCase):
         self.assertNotIn("<a", _inline("[x](data:text/html,evil)"))
         self.assertIn('<a href="https://example.com">y</a>', _inline("[y](https://example.com)"))
         self.assertIn("<a href=", _inline("[z](docs/readme.md)"))     # relative allowed
+
+
+class SubstantiveClaimTest(unittest.TestCase):
+    """B3: transcript shards must not become claims; sentence-sized statements must."""
+
+    def test_filters_fragments_keeps_statements(self):
+        from ai4research.operators.extraction import _is_substantive_claim
+        for junk in ("its head.", "mat.", "both.", "was", "hardware", "nearby.",
+                     "relying on a fixed tag."):
+            self.assertFalse(_is_substantive_claim(junk), junk)
+        for ok in ("governance point number 0 concerns auditable competency frameworks",
+                   "State-space models reduce the quadratic cost of self-attention on long sequences."):
+            self.assertTrue(_is_substantive_claim(ok), ok)
+        # boundary (locks the 30-char/5-word threshold + the tight github-metric minimum)
+        self.assertTrue(_is_substantive_claim("Repository metrics - stars: 0."))   # exactly 30 chars, 5 words
+        self.assertFalse(_is_substantive_claim("short four word fragment"))         # 4 words -> dropped
+
+
+class SourceClassCoverageGateTest(unittest.TestCase):
+    """M4: a supplied source class that yields zero evidence makes the run a *partial* brief."""
+
+    def test_flags_class_with_no_evidence(self):
+        from ai4research.operators.gates import gate_source_class_coverage
+        snap = {
+            "source_containers": [{"container_id": "C1", "source_pack_type": "youtube_channel"},
+                                  {"container_id": "C2", "source_pack_type": "github_repo"}],
+            "selected_source_items": [{"selected_item_id": "I1", "container_id": "C1"},
+                                      {"selected_item_id": "I2", "container_id": "C2"}],
+            "evidence": [{"evidence_id": "E1", "selected_item_id": "I1"}],   # github produced nothing
+        }
+        r = gate_source_class_coverage(snap, {})
+        self.assertEqual(r["status"], "warning")
+        self.assertEqual(r["metrics"]["failed_classes"], ["github_repo"])
+        snap["evidence"].append({"evidence_id": "E2", "selected_item_id": "I2"})   # now it has evidence
+        self.assertEqual(gate_source_class_coverage(snap, {})["status"], "pass")
+
+
+class ConfidenceQualityCapTest(unittest.TestCase):
+    """M5/M6: confidence is capped by source quality — weak sources never read as high."""
+
+    def test_caps_on_low_quality(self):
+        from ai4research.operators.llm import _confidence
+        c2 = {"e1": "A", "e2": "B"}                                  # two containers -> base 'high'
+        self.assertEqual(_confidence(["e1", "e2"], c2), "high")      # no quality map -> unchanged
+        self.assertEqual(_confidence(["e1", "e2"], c2, {"e1": "low", "e2": "low"}), "medium")  # capped
+        self.assertEqual(_confidence(["e1"], c2, {"e1": "low"}), "low")
+        self.assertEqual(_confidence(["e1", "e2"], c2, {"e1": "normal", "e2": "low"}), "high")  # mixed -> base
 
 
 if __name__ == "__main__":

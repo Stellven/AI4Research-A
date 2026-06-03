@@ -23,6 +23,12 @@ def _first_evidence_id(prompt: str) -> str:
     return match.group(0)
 
 
+def _first_claim_id(prompt: str) -> str:
+    match = re.search(r"run_[A-Za-z0-9_]+\.CLAIM\d+", prompt)
+    assert match is not None
+    return match.group(0)
+
+
 def _run_with_stub(tmp, records, *, pack="youtube_github_research", containers=None):
     ctx, work = support.stage(tmp, support.PROVING_TOPIC, containers or [support.local_container()])
     _write_run_config(ctx, {"domain_pack": pack, "model_runtime": "stub"})
@@ -70,6 +76,8 @@ def _snap(work):
 class Increment4Test(unittest.TestCase):
     def test_stub_grounded_claim_is_accepted_and_rendered(self):
         def records(prompt):
+            if "synthesized claims" not in prompt:   # only feed LLMSynthesis; silent elsewhere
+                return []
             return [{"claim_text": "Skills governance evidence",
                      "claim_type": "trend_claim",
                      "cited_evidence_ids": [_first_evidence_id(prompt)]}]
@@ -85,6 +93,8 @@ class Increment4Test(unittest.TestCase):
 
     def test_stub_hallucination_is_rejected_not_rendered(self):
         def records(prompt):
+            if "synthesized claims" not in prompt:   # only feed LLMSynthesis; silent elsewhere
+                return []
             return [{"claim_text": "Quantum robotics teleportation",
                      "claim_type": "trend_claim",
                      "cited_evidence_ids": [_first_evidence_id(prompt)]}]
@@ -145,6 +155,8 @@ class Increment4Test(unittest.TestCase):
 
     def test_schema_round_trips_llm_and_metric_columns(self):
         def records(prompt):
+            if "synthesized claims" not in prompt:   # only feed LLMSynthesis; silent elsewhere
+                return []
             return [{"claim_text": "Skills governance evidence",
                      "cited_evidence_ids": [_first_evidence_id(prompt)]}]
 
@@ -168,12 +180,16 @@ class Increment4Test(unittest.TestCase):
 class CodexRuntimeSmokeTest(unittest.TestCase):
     @unittest.skipUnless(shutil.which("codex"), "codex binary not available")
     def test_codex_runtime_dispatch_and_parse_with_mocked_subprocess(self):
-        def fake_run(cmd, input, text, capture_output, timeout, check):
-            out_path = Path(cmd[cmd.index("--output-last-message") + 1])
-            out_path.write_text('[{"claim_text":"x","cited_evidence_ids":["E1"]}]', encoding="utf-8")
-            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        class FakePopen:   # codex now runs via Popen + communicate (process-group kill on timeout)
+            def __init__(self, cmd, **kwargs):
+                self._out_path = Path(cmd[cmd.index("--output-last-message") + 1])
+                self.returncode = 0
 
-        with mock.patch("subprocess.run", side_effect=fake_run):
+            def communicate(self, input=None, timeout=None):
+                self._out_path.write_text('[{"claim_text":"x","cited_evidence_ids":["E1"]}]', encoding="utf-8")
+                return ("", "")
+
+        with mock.patch("subprocess.Popen", FakePopen):
             records = CodexRuntime(timeout=1).propose("prompt", {
                 "type": "array",
                 "items": {
@@ -199,11 +215,14 @@ class AnswerSynthesisTest(unittest.TestCase):
             if "deep-research dossier" not in prompt:   # question-derivation / LLMSynthesis prompts
                 return []
             eid = _first_evidence_id(prompt)
+            cid = _first_claim_id(prompt)
             return [{
                 "summary": f"The sources converge on a clear shift [{eid}]. This sentence connects them.",
                 "key_findings": [
-                    {"finding": "The leading repository shows strong adoption.", "evidence_ids": [eid]},
-                    {"finding": "An unsupported claim.", "evidence_ids": ["run_x.EV9999"]},
+                    {"finding": "The leading repository shows strong adoption.",
+                     "claim_ids": [cid], "evidence_ids": [eid]},
+                    {"finding": "An unsupported claim.",
+                     "claim_ids": ["run_x.CLAIM9999"], "evidence_ids": ["run_x.EV9999"]},
                 ],
                 "sections": [
                     {"title": "Adoption is consolidating", "body": f"Vendors are converging [{eid}] here."},
@@ -219,6 +238,7 @@ class AnswerSynthesisTest(unittest.TestCase):
             self.assertEqual(result.status, "finalized")
             a = work.read_rows("answer")[0]
             self.assertEqual(len(a["key_findings"]), 1)                   # ungrounded finding dropped
+            self.assertTrue(a["key_findings"][0]["evidence_ids"])         # always deep-links (no bare bullet)
             self.assertEqual(a["key_findings"][0]["confidence"], "low")   # single evidence/container
             self.assertEqual([s["title"] for s in a["sections"]], ["Adoption is consolidating"])  # ungrounded dropped
             md = (ctx.exports_dir / "final_report.md").read_text(encoding="utf-8")
@@ -237,6 +257,38 @@ class AnswerSynthesisTest(unittest.TestCase):
                 conn.close()
             self.assertIsNotNone(row)                   # the dossier is persisted (audit #3)
             self.assertTrue(json.loads(row[1]))         # key_findings round-trips as JSON
+            # S8: the persisted dossier reconciles with the gate_results it post-dates — the
+            # AnswerGroundingGate warning (the dropped EV9999) is reflected in warning_count.
+            gates = work.read_rows("gate_results")
+            self.assertTrue(any(r["gate_id"] == "AnswerGroundingGate" and r["status"] == "warning" for r in gates))
+            qd = work.read_rows("quality_dossier")[0]
+            self.assertEqual(qd["warning_count"], sum(1 for r in gates if r.get("status") == "warning"))
+
+    def test_raw_evidence_ids_never_leak_into_prose(self):
+        # B2: a live model sometimes writes evidence ids BARE (no brackets) in the prose; they must
+        # be linkified (valid) or stripped (unknown), never rendered raw — raw internal ids break
+        # deep-link auditability.
+        def stub(prompt):
+            if "deep-research dossier" not in prompt:
+                return []
+            eid, cid, bad = _first_evidence_id(prompt), _first_claim_id(prompt), "run_zzz.EV9999"
+            return [{
+                "summary": f"A bare valid ref {eid} and a bare invalid ref {bad} inline.",
+                "key_findings": [{"finding": f"Finding mentions {eid} bare.",
+                                  "claim_ids": [cid], "evidence_ids": [eid]}],
+                "sections": [{"title": f"Angle on {eid} and {bad}", "body": f"Section body with a bare {eid}."}],
+                "outlook": [f"Outlook line with bare {eid}."],
+                "caveats": ["A plain caveat."],
+                "open_questions": [f"Open question with bare {eid} and {bad}?"],
+            }]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx, work, result = _run_with_stub(tmp, stub)
+            self.assertEqual(result.status, "finalized")
+            md = (ctx.exports_dir / "final_report.md").read_text(encoding="utf-8")
+            prose = md.split("## Evidence Table")[0]          # dossier prose, before the audit tables
+            self.assertNotRegex(prose, r"run_[A-Za-z0-9_]+\.EV\d+")   # no raw internal id in prose
+            self.assertNotIn("run_zzz.EV9999", md)                    # the unknown id is stripped everywhere
 
 
 class QuestionGraphDerivationTest(unittest.TestCase):

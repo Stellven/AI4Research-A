@@ -29,10 +29,13 @@ class ReportData:
         self.evidence = rows("evidence")
         self.claims = rows("claims")
         self.claim_evidence = rows("claim_evidence")
+        self.claim_edges = rows("claim_edges")
         self.citations = rows("citations")
         self.figures = rows("figures")
         self.answer = rows("answer")
         self.question_nodes = rows("question_graph_nodes")
+        self.entities = rows("entities")
+        self.claim_entities = rows("claim_entities")
         self.approved = bool(self.dossier.get("approved_for_report_rendering"))
 
         self.by_item = {i["selected_item_id"]: i for i in self.items}
@@ -41,6 +44,17 @@ class ReportData:
         self.by_evidence = {e["evidence_id"]: e for e in self.evidence}
         self.by_claim = {c["claim_id"]: c for c in self.claims}
         self.cite_by_evidence = {c["evidence_id"]: c for c in self.citations}
+        # each claim's and each evidence's source container — for the cross-source counter-search render.
+        _item_container = {i["selected_item_id"]: i.get("container_id") for i in self.items}
+        self.container_by_evidence = {e["evidence_id"]: _item_container.get(e.get("selected_item_id"))
+                                      for e in self.evidence}
+        _support: dict = {}
+        for ce in self.claim_evidence:
+            _support.setdefault(ce["claim_id"], []).append(ce["evidence_id"])
+        self.container_by_claim = {cid: next((self.container_by_evidence.get(e) for e in eids
+                                              if self.container_by_evidence.get(e)), None)
+                                   for cid, eids in _support.items()}
+        self.container_label = {c["container_id"]: (c.get("label") or c["container_id"]) for c in self.containers}
 
 
 def _summary(d: ReportData) -> list[str]:
@@ -90,7 +104,7 @@ def _answer_section(d: ReportData) -> list[str]:
     if findings:
         out += ["### Key findings at a glance", ""]
         for item in findings:
-            text = (item.get("finding") or "").strip()
+            text = _linkify_evidence((item.get("finding") or "").strip(), d)
             if not text:
                 continue
             cites = _cites(item.get("evidence_ids", []), d)
@@ -99,7 +113,7 @@ def _answer_section(d: ReportData) -> list[str]:
             out.append(f"- {text}" + ((" " + cites) if cites else "") + tag)
         out.append("")
     for sec in a.get("sections", []):
-        title = (sec.get("title") or "").strip()
+        title = _linkify_evidence((sec.get("title") or "").strip(), d)   # B2: titles too — no raw ids in a heading
         body = _linkify_evidence(sec.get("body", ""), d)
         if title and body:
             out += [f"### {title}", "", body, ""]
@@ -111,19 +125,26 @@ def _answer_section(d: ReportData) -> list[str]:
     if caveats or open_q:
         out += ["### Caveats & open questions", ""]
         out += [f"- {_linkify_evidence(x, d)}" for x in caveats]
-        out += [f"- _Open:_ {x}" for x in open_q]
+        out += [f"- _Open:_ {_linkify_evidence(x, d)}" for x in open_q]
         out.append("")
     return out
 
 
+_EVID_TOKEN = re.compile(r"\[?\b(run_[A-Za-z0-9_]+\.EV\d+)\b\]?")
+
+
 def _linkify_evidence(text: str, d: ReportData) -> str:
-    """Resolve inline `[evidence_id]` references in synthesized prose to citation deep links."""
+    """Resolve inline evidence-id references in synthesized prose to citation deep links — whether
+    the model wrote them bracketed (`[run_..EV0001]`) or bare (`run_..EV0001`). A raw internal
+    evidence id must NEVER survive into reader-facing prose (it breaks deep-link auditability), so
+    any evidence-id token that can't be resolved to a citation is stripped."""
     def repl(match):
         cite = d.cite_by_evidence.get(match.group(1))
-        if not cite:
-            return match.group(0)
-        return f"[{cite['label']}]({cite['url']})" if cite.get("url") else f"[{cite['label']}]"
-    return re.sub(r"\[([\w.:-]+)\]", repl, text or "")
+        if cite:
+            return f"[{cite['label']}]({cite['url']})" if cite.get("url") else f"[{cite['label']}]"
+        return ""   # unknown / unresolved id -> strip; never leak a raw run_..EV.. token
+    out = _EVID_TOKEN.sub(repl, text or "")
+    return re.sub(r"[ \t]{2,}", " ", out).strip()
 
 
 def _cites(evidence_ids: list, d: ReportData) -> str:
@@ -161,16 +182,28 @@ def _coverage(d: ReportData) -> list[str]:
     return out
 
 
-def _findings(d: ReportData) -> list[str]:
-    out = ["## Evidence-Backed Findings", ""]
-    accepted = [c for c in d.claims if c["status"] == "accepted"]
-    if not accepted:
+def _findings(d: ReportData, *, as_appendix: bool = False) -> list[str]:
+    # On a dossier run the synthesized "Key findings at a glance" is the headline; this 1:1
+    # claim-per-evidence list is demoted to an auditable appendix so the report carries one
+    # headline, not three overlapping "what we found" surfaces. On a deterministic (no-dossier)
+    # run it stays the lead findings surface.
+    if as_appendix:
+        out = ["## Full claim ledger (appendix)", "",
+               "Every accepted (and qualified) claim, one-to-one with its evidence — the auditable "
+               "expansion of the findings synthesized above.", ""]
+    else:
+        out = ["## Evidence-Backed Findings", ""]
+    # Qualified claims (#22 C1) stay in the ledger, visibly hedged; rejected claims are excluded
+    # (they surface only in the Contradictions section). On a no-runtime run nothing is qualified,
+    # so this is accepted-only and byte-identical.
+    shown = [c for c in d.claims if c["status"] in ("accepted", "qualified")]
+    if not shown:
         out += ["_No accepted claims for this run._", ""]
         return out
     support = {}
     for ce in d.claim_evidence:
         support.setdefault(ce["claim_id"], []).append(ce["evidence_id"])
-    for c in accepted:
+    for c in shown:
         labels = []
         for eid in support.get(c["claim_id"], []):
             cite = d.cite_by_evidence.get(eid)
@@ -180,8 +213,52 @@ def _findings(d: ReportData) -> list[str]:
                 else:
                     labels.append(f"[{cite['label']}]")
         suffix = (" " + " ".join(labels)) if labels else ""
-        out.append(f"- {c['claim_text']}{suffix}")
+        prefix = "_(qualified)_ " if c["status"] == "qualified" else ""
+        out.append(f"- {prefix}{c['claim_text']}{suffix}")
     out.append("")
+    return out
+
+
+def _contradictions(d: ReportData) -> list[str]:
+    """#22/9: cross-source disputes + rejected/qualified claims, straight from the claim graph. A
+    counter-search writes evidence -> claim `refutes`/`qualifies` edges; each is rendered as the
+    claim *disputed by* counter-evidence from another source. Returns [] when the graph holds none,
+    so a no-runtime run — which can produce neither — stays byte-identical."""
+    edges = [e for e in d.claim_edges if e.get("type") in ("refutes", "qualifies")]
+
+    def _review_reason(c):   # the marker only the contradiction reviewer writes — NOT EntailmentGate
+        for x in (c.get("limitations") or []):
+            if isinstance(x, str) and x.startswith(("rejected on review", "qualified by")):
+                return x
+        return None
+
+    # A hallucinated claim rejected by EntailmentGate carries no such marker and must stay hidden
+    # (don't give fabricated text oxygen); only the contradiction review's reasoned verdicts surface.
+    flagged = [c for c in d.claims if c.get("status") in ("rejected", "qualified") and _review_reason(c)]
+    if not edges and not flagged:
+        return []
+
+    def _dispute_bullet(e):
+        claim_id, ev_id = e["to_id"], e["from_id"]              # evidence -> claim edge
+        claim_text = d.by_claim.get(claim_id, {}).get("claim_text", claim_id)
+        ev = d.by_evidence.get(ev_id, {})
+        summ = (ev.get("summary") or ev.get("quoted_text") or "").strip().replace("\n", " ")[:160]
+        src = d.container_label.get(d.container_by_evidence.get(ev_id), "another source")
+        cite = d.cite_by_evidence.get(ev_id)
+        link = f" ([{cite['label']}]({cite['url']}))" if cite and cite.get("url") else ""
+        verb = "disputed by" if e["type"] == "refutes" else "qualified by"
+        return f"- _{claim_text}_ — **{verb}** {src}: {summ}{link}"
+
+    out = ["## Contradictions & rejected claims", ""]
+    if edges:                                  # all cross-source by construction (the counter-search)
+        out += ["### Where sources disagree", ""] + [_dispute_bullet(e) for e in edges] + [""]
+    if flagged:
+        out += ["### Rejected / qualified claims", ""]
+        for c in flagged:
+            reason = _review_reason(c) or ("rejected (no recorded reason)"
+                                           if c["status"] == "rejected" else "qualified")
+            out.append(f"- **[{c['status']}]** {c.get('claim_text', c['claim_id'])} — {reason}")
+        out.append("")
     return out
 
 
@@ -217,6 +294,46 @@ def _figures(d: ReportData) -> list[str]:
         for row in rows:
             out.append("| " + " | ".join("—" if value is None else str(value) for value in row) + " |")
         out.append("")
+    return out
+
+
+_CONCEPT_CAP = 18   # most cross-source concepts shown; full ontology lives in the claim ledger
+
+
+def _key_concepts(d: ReportData) -> list[str]:
+    """The topic ontology made legible (#10c): the concepts the analysis turns on, where sources
+    engage them, and which are CONTESTED — appearing in claims from >=2 independent sources, where
+    cross-source disagreement lives. Renders nothing without an ontology, so the deterministic
+    (no-runtime) report is unchanged."""
+    if not d.entities or not d.claim_entities:
+        return []
+    accepted = {c["claim_id"] for c in d.claims if c.get("status") in ("accepted", "qualified")}
+    ent = {e["entity_id"]: e for e in d.entities}
+    by_entity: dict = {}
+    for link in d.claim_entities:
+        cid, eid = link.get("claim_id"), link.get("entity_id")
+        if cid not in accepted or eid not in ent:
+            continue
+        rec = by_entity.setdefault(eid, {"claims": set(), "containers": set()})
+        rec["claims"].add(cid)
+        cont = d.container_by_claim.get(cid)
+        if cont:
+            rec["containers"].add(cont)
+    ranked = sorted(((eid, len(r["containers"]), len(r["claims"])) for eid, r in by_entity.items()),
+                    key=lambda r: (-r[1], -r[2]))
+    if not ranked:
+        return []
+    contested = sum(1 for _, nsrc, _ in ranked if nsrc >= 2)
+    out = ["## Key concepts", "",
+           f"The concepts this topic turns on — {len(ranked)} derived from the claims, {contested} "
+           "**contested** (engaged by ≥2 independent sources, where cross-source disagreement lives). "
+           "⚑ marks a contested concept.", ""]
+    for eid, nsrc, nclaims in ranked[:_CONCEPT_CAP]:
+        e = ent[eid]
+        flag = "⚑ " if nsrc >= 2 else ""
+        out.append(f"- {flag}**{e.get('canonical_name')}** ({e.get('entity_type') or 'Concept'}) — "
+                   f"{nsrc} source{'s' if nsrc != 1 else ''}, {nclaims} claim{'s' if nclaims != 1 else ''}")
+    out.append("")
     return out
 
 
@@ -276,11 +393,19 @@ def render_markdown(d: ReportData) -> tuple[str, str]:
     topic = d.run.get("topic", "")
     if d.approved:
         title = f"Phase 0 Evidence Report: {topic}"
-        # dossier leads; the "How this was researched" methodology sits near the end (like the
-        # exemplar) before the source appendix; evidence + traceability are the audit detail.
-        body = (_answer_section(d) + _coverage(d) + _findings(d) + _figures(d)
-                + _evidence_table(d) + _gaps(d) + _traceability(d) + _summary(d)
-                + _full_source_appendix(d))
+        if d.answer:
+            # dossier run: the synthesized findings lead; "How this was researched" sits near the
+            # end (like the exemplar), then the 1:1 claim ledger as an auditable appendix.
+            body = (_answer_section(d) + _coverage(d) + _key_concepts(d) + _figures(d) + _evidence_table(d)
+                    + _contradictions(d) + _gaps(d) + _traceability(d) + _summary(d)
+                    + _findings(d, as_appendix=True) + _full_source_appendix(d))
+        else:
+            # deterministic run: the evidence-backed findings are the only headline (unchanged).
+            # _contradictions is empty here (no refutes/qualifies edges or non-accepted claims
+            # without a runtime), so the deterministic output stays byte-identical.
+            body = (_coverage(d) + _findings(d) + _figures(d) + _evidence_table(d)
+                    + _contradictions(d) + _gaps(d) + _traceability(d) + _summary(d)
+                    + _full_source_appendix(d))
         kind = "markdown_report"
     else:
         title = f"Phase 0 Diagnostic Report: {topic}"
@@ -298,23 +423,39 @@ def build_view_model(d: ReportData) -> dict:
     yt = sum(1 for c in citations if "&t=" in c["url"])
     gh = sum(1 for c in citations if "#L" in c["url"])
     accepted = sum(1 for c in d.claims if c.get("status") == "accepted")
+    # ledger volume = what the "Full claim ledger" actually renders: accepted + qualified (#22 C1),
+    # never rejected. Counting all claims (incl. rejected) would overstate the rendered ledger.
+    ledger = sum(1 for c in d.claims if c.get("status") in ("accepted", "qualified"))
     # "findings" are the synthesized, ranked key findings (Increment 5) — the report's headline.
     # They are NOT the same as claims: claims include the 1:1 evidence-backed extractive claims
     # (the ledger volume), so surfacing claim count as "findings" would overstate the result.
     findings = len((d.answer[0].get("key_findings") or [])) if d.answer else 0
+    # reader-meaningful trust signals (#21): sources we read, where claims disagree, what was
+    # rejected on review — not span/claim/gate telemetry.
+    sources = len(d.documents)
+    # disputed claims = distinct claims with cross-source counter-evidence (the counter-search target)
+    disagreements = len({e["to_id"] for e in d.claim_edges if e.get("type") in ("refutes", "qualifies")})
+    rejected = sum(1 for c in d.claims if c.get("status") == "rejected"
+                   and any(isinstance(x, str) and x.startswith(("rejected on review", "qualified by"))
+                           for x in (c.get("limitations") or [])))
     gp = sum(1 for g in d.gate_results if g.get("status") == "pass")
     gw = sum(1 for g in d.gate_results if g.get("status") == "warning")
     gf = sum(1 for g in d.gate_results if g.get("status") in ("hard_fail", "repairable_fail"))
+    # M4: source classes that contributed no evidence — the run is a *partial* brief, say so.
+    incomplete = next((g.get("metrics", {}).get("failed_classes", []) for g in d.gate_results
+                       if g.get("gate_id") == "SourceClassCoverageGate"), [])
     return {
         "heading": "Phase 0 Evidence Report" if d.approved else "Phase 0 Diagnostic Report",
         "topic": d.run.get("topic", ""),
         "run_id": d.run.get("run_id", ""),
         "generated": d.run.get("completed_at") or d.run.get("created_at") or "",
         "mode": d.contract.get("domain_pack_id") or "generic",
+        "incomplete_classes": incomplete,
         "gate_status": "BLOCKED" if not d.approved else ("WARN" if gw else "PASS"),
         "metrics": {
             "documents": len(d.documents), "spans": len(d.spans), "evidence": len(d.evidence),
-            "findings": findings, "claims": len(d.claims), "claims_accepted": accepted,
+            "findings": findings, "claims": ledger, "claims_accepted": accepted,
+            "sources": sources, "disagreements": disagreements, "rejected": rejected,
             "citations": len(citations), "citations_youtube": yt, "citations_github": gh,
             "gates_pass": gp, "gates_warn": gw, "gates_fail": gf, "gates_total": len(d.gate_results),
         },
@@ -324,65 +465,87 @@ def build_view_model(d: ReportData) -> dict:
 # Self-contained dossier styling: one indigo accent, semantic gate colours, an editorial
 # serif-heading / sans-body pairing, zebra tables, sticky section nav, dark-mode + print
 # variants. No external assets, fonts, or JS — the report stays a single portable file.
+_THEME_JS = (
+    "(function(){var r=document.documentElement;"
+    "function s(t){r.setAttribute('data-theme',t);}"
+    "try{if(matchMedia('(prefers-color-scheme:dark)').matches)s('dark');}catch(e){}"
+    "window.toggleDark=function(){s(r.getAttribute('data-theme')==='dark'?'light':'dark');};})();"
+)
+
+# Editorial brief: a reading-first 3-column layout (contents · ~720px prose column · trust rail),
+# one restrained accent (no gradient), hairline section rules (not cards), system+serif type, and
+# a real dark toggle. The trust rail shows reader-meaningful signals — sources / findings / traced /
+# disagreements / pass+advisories — never raw dev telemetry (#21).
 _CSS = """
 *{box-sizing:border-box}
-:root{--bg:#fbfbfa;--surface:#fff;--ink:#1c1c1e;--muted:#6b6b76;--line:#e6e6ea;
---accent:#5a4be7;--accent2:#8b5cf6;--green:#1a7f4b;--green-bg:#e7f5ec;--amber:#8a5d00;
---amber-bg:#fdf3e0;--red:#b3261e;--red-bg:#fbe9e7;--yt:#c4302b;--gh:#5a4be7;
---serif:Georgia,"Times New Roman",serif;--sans:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;
+:root{--bg:#fbfbfa;--surface:#fff;--ink:#1f232a;--muted:#5b6471;--faint:#8a929e;
+--line:#ecedf1;--border:#e3e6ea;--accent:#2f5bd0;--accent-soft:#eef2fc;
+--good:#0f7b4f;--warn:#9a6b00;--red:#b3261e;
+--serif:Georgia,"Iowan Old Style","Times New Roman",serif;
+--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,Helvetica,Arial,sans-serif;
 --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.62;font-size:16px}
-.topbar{height:6px;background:linear-gradient(90deg,var(--accent),var(--accent2))}
-.report-header{max-width:920px;margin:0 auto;padding:30px 24px 6px}
-.report-header h1{font-family:var(--serif);font-size:30px;line-height:1.2;margin:0 0 6px}
-.report-header .topic{font-size:18px;color:var(--muted);margin:0 0 14px}
-.report-header .meta{font-family:var(--mono);font-size:12.5px;color:var(--muted);display:flex;
-gap:16px;flex-wrap:wrap;align-items:center}
-.badge{padding:3px 11px;border-radius:999px;font-weight:600;font-size:12px;font-family:var(--sans)}
-.badge.pass{background:var(--green-bg);color:var(--green)}
-.badge.warn{background:var(--amber-bg);color:var(--amber)}
-.badge.blocked{background:var(--red-bg);color:var(--red)}
-.metric-band{max-width:920px;margin:18px auto;padding:0 24px;display:grid;
-grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px}
-.metric{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:13px 16px}
-.metric .num{font-size:24px;font-weight:700;font-family:var(--serif)}
-.metric .lbl{font-size:11.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-top:2px}
-.metric .sub{font-size:11.5px;color:var(--muted);margin-top:5px}
-.report-nav{position:sticky;top:0;z-index:5;background:rgba(251,251,250,.92);
-backdrop-filter:blur(6px);border-bottom:1px solid var(--line)}
-.report-nav ul{max-width:920px;margin:0 auto;padding:11px 24px;display:flex;gap:18px;
-flex-wrap:wrap;list-style:none;font-size:13px}
-.report-nav a{color:var(--muted);text-decoration:none}
-.report-nav a:hover{color:var(--accent)}
-.report-main{max-width:920px;margin:0 auto;padding:8px 24px 30px}
-.report-section{background:var(--surface);border:1px solid var(--line);border-radius:14px;
-padding:4px 22px 18px;margin:18px 0}
-.report-section h2{font-family:var(--serif);font-size:21px;border-bottom:2px solid var(--line);
-padding-bottom:8px;margin:18px 0 14px}
-.report-section h3{font-size:15px;color:var(--accent);margin:18px 0 8px}
-table{border-collapse:collapse;width:100%;font-size:13.5px;margin:10px 0;
-border:1px solid var(--line);border-radius:10px;overflow:hidden}
-th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
-thead th{background:#f2f2f5;font-size:11.5px;text-transform:uppercase;letter-spacing:.03em;color:var(--muted)}
-tbody tr:nth-child(even){background:#fafafb}
-ul{padding-left:20px}li{margin:5px 0}
-blockquote{margin:12px 0;padding:9px 14px;border-left:4px solid var(--amber);
-background:var(--amber-bg);border-radius:0 8px 8px 0;color:#6a4e16}
-a{color:var(--accent)}
-main a[href*="youtube.com"]{color:var(--yt);text-decoration:none;font-weight:600}
-main a[href*="youtube.com"]::before{content:"\\23F1  "}
-main a[href*="github.com"]{color:var(--gh);text-decoration:none;font-weight:600}
-main a[href*="github.com"]::before{content:"#\\2009";font-family:var(--mono)}
-.report-footer{max-width:920px;margin:0 auto;padding:18px 24px 50px;color:var(--muted);
-font-size:12px;font-family:var(--mono);border-top:1px solid var(--line)}
-@media (max-width:640px){.report-header h1{font-size:24px}
-.report-main,.report-header,.metric-band{padding-left:16px;padding-right:16px}}
-@media (prefers-color-scheme:dark){:root{--bg:#161618;--surface:#1f1f23;--ink:#e9e9ec;
---muted:#9a9aa6;--line:#2c2c33;--green-bg:#13301f;--amber-bg:#332811;--red-bg:#3a1714;
---yt:#ff7b73;--gh:#a899ff;--accent:#a899ff}
-thead th{background:#26262c}tbody tr:nth-child(even){background:#1b1b1f}
-blockquote{color:#d8c79a}}
-@media print{.report-nav{display:none}.report-section{break-inside:avoid;border:none;padding:0}}
+html[data-theme=dark]{--bg:#0d0f13;--surface:#15181e;--ink:#e7eaf0;--muted:#9aa2ad;--faint:#6b7480;
+--line:#1d212a;--border:#262b34;--accent:#8ea2ff;--accent-soft:#171b2c;
+--good:#54c08a;--warn:#caa64a;--red:#ff7b73}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
+font-size:17px;line-height:1.66;-webkit-font-smoothing:antialiased}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+.topbar{position:sticky;top:0;z-index:40;height:50px;display:flex;align-items:center;
+padding:0 22px;border-bottom:1px solid var(--border);background:var(--bg)}
+.topbar .brand{font-size:13px;font-weight:650;letter-spacing:.02em;color:var(--muted)}
+.topbar .sp{flex:1}
+.topbar .act{cursor:pointer;background:transparent;border:1px solid var(--border);color:var(--muted);
+border-radius:8px;padding:5px 11px;font-size:12.5px;font-family:var(--sans)}
+.topbar .act:hover{color:var(--ink)}
+.app{max-width:1180px;margin:0 auto;display:grid;
+grid-template-columns:200px minmax(0,1fr) 232px;gap:38px;padding:0 24px}
+.col-toc,.col-rail{position:sticky;top:50px;align-self:start;max-height:calc(100vh - 50px);
+overflow-y:auto;padding:32px 0 60px}
+.col-main{min-width:0;padding:36px 0 90px}
+.toc-h,.rail-h{font-size:11px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;
+color:var(--faint);margin:0 0 12px}
+#toc{display:flex;flex-direction:column;gap:1px}
+#toc a{font-size:13px;color:var(--muted);padding:5px 9px;border-radius:6px;
+border-left:2px solid transparent;line-height:1.35}
+#toc a:hover{background:var(--accent-soft);color:var(--ink)}
+.hero{max-width:720px;margin:0 0 4px}
+.kicker{font-size:11.5px;font-weight:700;letter-spacing:.13em;text-transform:uppercase;color:var(--accent)}
+.hero h1{font-family:var(--serif);font-size:32px;line-height:1.18;letter-spacing:-.01em;
+font-weight:600;margin:.25em 0 .25em}
+.dateline{font-size:12.5px;color:var(--faint);font-family:var(--mono);margin:0}
+.col-main section{max-width:720px}
+.col-main section+section{margin-top:32px;padding-top:28px;border-top:1px solid var(--line)}
+.col-main h2{font-family:var(--serif);font-size:22px;font-weight:600;letter-spacing:-.01em;
+margin:0 0 .5em;scroll-margin-top:62px}
+.col-main h3{font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;
+color:var(--muted);margin:1.4em 0 .5em}
+p{margin:0 0 1em}
+.col-main section:first-of-type>p:first-of-type{font-size:19px;line-height:1.6}
+ul,ol{padding-left:22px}li{margin:7px 0}
+blockquote{margin:14px 0;padding:2px 0 2px 16px;border-left:3px solid var(--border);
+color:var(--muted);font-style:italic}
+code{background:var(--accent-soft);border-radius:5px;padding:.08em .36em;font-size:85%;font-family:var(--mono)}
+.tablewrap{overflow-x:auto;border:1px solid var(--border);border-radius:10px;margin:1.1em 0}
+table{border-collapse:collapse;width:100%;font-size:13.5px}
+th,td{border-bottom:1px solid var(--line);padding:9px 12px;text-align:left;vertical-align:top}
+th{background:var(--accent-soft);font-weight:650;font-size:11.5px;text-transform:uppercase;
+letter-spacing:.03em;color:var(--muted)}
+tbody tr:last-child td{border-bottom:0}
+main a[href*="youtube.com"],main a[href*="github.com"]{font-weight:600}
+.trust{display:flex;flex-direction:column;gap:13px}
+.trust .t-num{font-family:var(--serif);font-size:23px;font-weight:600;line-height:1}
+.trust .t-lbl{font-size:11.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-top:3px}
+.trust .t-note{font-size:12.5px;line-height:1.45;color:var(--muted)}
+.trust .ok{color:var(--good)}.trust .flag{color:var(--warn)}
+.trust .rule{height:1px;background:var(--line);margin:1px 0}
+.report-footer{max-width:1180px;margin:0 auto;padding:20px 24px 60px;color:var(--faint);
+font-size:12px;font-family:var(--mono);border-top:1px solid var(--border)}
+@media (max-width:980px){.app{grid-template-columns:1fr;gap:0}
+.col-toc,.col-rail{position:static;max-height:none;padding:14px 0;border-bottom:1px solid var(--line)}
+.col-rail{order:-1}.col-main section,.hero{max-width:none}}
+@media print{.topbar,.col-toc,.col-rail{display:none}.app{display:block}.col-main section{break-inside:avoid}}
 """
 
 
@@ -398,10 +561,15 @@ def render_html(markdown: str, title: str, view_model: dict | None = None) -> st
     head = ("<meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
             f"<title>{_html.escape(title)}</title><style>{_CSS}</style>")
     return ("<!doctype html><html lang='en'><head>" + head + "</head><body>"
-            "<div class='topbar'></div>"
-            + _header_html(view_model) + _metric_band_html(view_model) + _nav_html(sections)
-            + "<main class='report-main'>" + body + "</main>" + _footer_html(view_model)
-            + "</body></html>")
+            "<div class='topbar'><span class='brand'>AI4Research · Deep Research</span>"
+            "<span class='sp'></span>"
+            "<button class='act' type='button' onclick='toggleDark()'>◐ Theme</button></div>"
+            "<div class='app'>"
+            + "<aside class='col-toc'>" + _nav_html(sections) + "</aside>"
+            + "<main class='col-main'>" + _header_html(view_model) + body + "</main>"
+            + "<aside class='col-rail'>" + _metric_band_html(view_model) + "</aside>"
+            + "</div>" + _footer_html(view_model)
+            + "<script>" + _THEME_JS + "</script></body></html>")
 
 
 def _slug(text: str) -> str:
@@ -462,52 +630,69 @@ def _convert_body(lines: list[str], drop_first_h1: bool) -> tuple[str, list[tupl
 
 
 def _header_html(vm: dict) -> str:
-    cls = {"PASS": "pass", "WARN": "warn", "BLOCKED": "blocked"}.get(vm["gate_status"], "warn")
-    meta = [f"Run {_html.escape(vm['run_id'])}"]
-    if vm.get("generated"):
-        meta.append(f"Generated {_html.escape(vm['generated'])}")
-    meta.append(f"Mode {_html.escape(vm['mode'])}")
-    meta_html = "".join(f"<span>{m}</span>" for m in meta)
-    return ("<header class='report-header'>"
-            f"<h1>{_html.escape(vm['heading'])}</h1>"
-            f"<p class='topic'>{_html.escape(vm['topic'])}</p>"
-            f"<div class='meta'>{meta_html}<span class='badge {cls}'>{vm['gate_status']}</span></div></header>")
+    """The reading column's hero: a kicker, the topic as the title, and a quiet dateline. The
+    gate status lives in the trust rail (reader-meaningful), not a badge here."""
+    if vm.get("gate_status") == "BLOCKED":
+        kicker = "Diagnostic"
+    elif vm.get("incomplete_classes"):
+        kicker = "Partial brief"
+    else:
+        kicker = "Research Brief"
+    dateline = [_html.escape(vm["generated"])] if vm.get("generated") else []
+    dateline.append(f"run {_html.escape(vm['run_id'])}")
+    return ("<div class='hero'>"
+            f"<div class='kicker'>{kicker}</div>"
+            f"<h1>{_html.escape(vm.get('topic') or vm['heading'])}</h1>"
+            f"<p class='dateline'>{' · '.join(dateline)}</p></div>")
 
 
 def _metric_band_html(vm: dict) -> str:
+    """The trust rail — what a reader needs to trust the report: how many sources, how many
+    findings, whether every claim is traced, where sources disagree, and a plain quality line.
+    Never raw dev telemetry (no span/claim/gate counts) — that is the #21 principle."""
     m = vm["metrics"]
-    cards = [
-        # Findings (synthesized, the headline) are distinct from the claim/evidence ledger volume.
-        (m["findings"], "Findings", "synthesized" if m["findings"] else "no LLM synthesis"),
-        (m["documents"], "Documents", f"{m['spans']} spans"),
-        (m["evidence"], "Evidence", f"{m['claims']} claims (ledger)"),
-        (m["citations"], "Deep Links", f"⏱ {m['citations_youtube']}  ·  # {m['citations_github']}"),
-        # user-legible quality, not a raw gate tally (#21): passed/blocked + advisory count
-        ("✗ Blocked" if m["gates_fail"] else "✓ Passed", "Quality checks",
-         (f"{m['gates_warn']} advisory" if m["gates_warn"] == 1 else f"{m['gates_warn']} advisories")
-         if m["gates_warn"] else "all clear"),
-    ]
-    out = ["<section class='metric-band'>"]
-    for num, lbl, sub in cards:
-        sub_html = f"<div class='sub'>{_html.escape(str(sub))}</div>" if sub else ""
-        out.append(f"<div class='metric'><div class='num'>{_html.escape(str(num))}</div>"
-                   f"<div class='lbl'>{_html.escape(lbl)}</div>{sub_html}</div>")
-    out.append("</section>")
+    out = ["<div class='rail-h'>At a glance</div><div class='trust'>"]
+
+    def stat(num, lbl):
+        return (f"<div><div class='t-num'>{_html.escape(str(num))}</div>"
+                f"<div class='t-lbl'>{_html.escape(lbl)}</div></div>")
+
+    out.append(stat(m.get("sources", m.get("documents", 0)), "sources"))
+    for cls in (vm.get("incomplete_classes") or []):     # M4: a whole source class contributed nothing
+        out.append(f"<div class='t-note flag'>⚠ incomplete — no {_html.escape(cls)} evidence</div>")
+    if m["findings"]:                       # synthesized headline findings (LLM run)
+        out.append(stat(m["findings"], "key finding" if m["findings"] == 1 else "key findings"))
+    else:                                   # deterministic run: the evidence-backed claim ledger
+        out.append(stat(m.get("claims", 0), "claim" if m.get("claims") == 1 else "claims"))
+    out.append("<div class='rule'></div>")
+    if m.get("citations"):
+        out.append("<div class='t-note ok'>✓ every claim traced to evidence</div>")
+    dis, rej = m.get("disagreements", 0), m.get("rejected", 0)
+    if dis:
+        out.append(f"<div class='t-note flag'>⚠ {dis} point{'s' if dis != 1 else ''} of disagreement</div>")
+    if rej:
+        out.append(f"<div class='t-note flag'>⚠ {rej} claim{'s' if rej != 1 else ''} rejected on review</div>")
+    out.append("<div class='rule'></div>")
+    blocked = m.get("gates_fail")
+    adv = m.get("gates_warn", 0)
+    note = "all checks clear" if not adv else (f"{adv} advisory" if adv == 1 else f"{adv} advisories")
+    out.append(f"<div class='t-note {'flag' if blocked else 'ok'}'>"
+               f"{'✗ Blocked' if blocked else '✓ Passed'} · {note}</div>")
+    out.append("</div>")
     return "".join(out)
 
 
 def _nav_html(sections: list[tuple[str, str]]) -> str:
     if not sections:
         return ""
-    links = "".join(f"<li><a href='#{s}'>{_html.escape(t)}</a></li>" for s, t in sections)
-    return f"<nav class='report-nav'><ul>{links}</ul></nav>"
+    links = "".join(f"<a href='#{s}'>{_html.escape(t)}</a>" for s, t in sections)
+    return f"<div class='toc-h'>Contents</div><nav id='toc'>{links}</nav>"
 
 
 def _footer_html(vm: dict) -> str:
-    bits = [f"Run {_html.escape(vm['run_id'])}"]
-    if vm.get("generated"):
-        bits.append(_html.escape(vm["generated"]))
-    bits.append("Phase 0 · deterministic research compiler")
+    bits = [_html.escape(vm["generated"])] if vm.get("generated") else []
+    bits.append(f"run {_html.escape(vm['run_id'])}")
+    bits.append("AI4Research · deterministic research compiler (Phase 0)")
     return f"<footer class='report-footer'>{' · '.join(bits)}</footer>"
 
 
@@ -520,7 +705,7 @@ def _html_table(rows: list[str]) -> str:
     body = [cells(r) for r in rows[2:]]  # row 1 is the markdown separator
     thead = "<tr>" + "".join(f"<th>{_inline(c)}</th>" for c in header) + "</tr>"
     tbody = "".join("<tr>" + "".join(f"<td>{_inline(c)}</td>" for c in r) + "</tr>" for r in body)
-    return f"<table>{thead}{tbody}</table>"
+    return f"<div class='tablewrap'><table>{thead}{tbody}</table></div>"
 
 
 def _inline(s: str) -> str:

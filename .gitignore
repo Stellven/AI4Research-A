@@ -1,6 +1,7 @@
 # Generated run artifacts and the SQLite store (regenerable; not source)
 runs/
 outputs/
+ai4research/reports/
 *.db
 
 # Python

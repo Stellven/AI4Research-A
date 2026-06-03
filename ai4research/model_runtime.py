@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import signal
 import subprocess
 import tempfile
 from pathlib import Path
@@ -11,6 +13,23 @@ from typing import Protocol
 
 class ModelRuntimeError(Exception):
     """Raised when a model runtime cannot return structured proposals."""
+
+
+def _kill_process_group(proc: "subprocess.Popen") -> None:
+    """SIGKILL the whole codex process tree (the node wrapper + its grandchild worker) so a
+    network-stuck call cannot outlive the timeout as an orphan holding the pipes open. The process
+    was started with start_new_session=True, so its pid leads its own group."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=10)   # reap; bounded so a wedged group cannot re-hang the caller
+    except (subprocess.TimeoutExpired, OSError):
+        pass
 
 
 class ModelRuntime(Protocol):
@@ -55,14 +74,24 @@ class CodexRuntime:
                     "codex", "exec", "--skip-git-repo-check", "--ephemeral", "--sandbox", "read-only",
                     "--output-schema", str(schema_path), "--output-last-message", str(out_path), "-",
                 ]
-                proc = subprocess.run(
-                    cmd, input=prompt, text=True, capture_output=True, timeout=self.timeout, check=False
+                # `codex` is a node wrapper that spawns a grandchild worker. subprocess.run(timeout=)
+                # only SIGKILLs the direct child and then blocks in communicate() on the grandchild's
+                # inherited pipes — so a network-stuck codex call ignores the timeout for hours and
+                # leaks orphans. Run it in its own process group and SIGKILL the WHOLE group on timeout.
+                proc = subprocess.Popen(
+                    cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, start_new_session=True,
                 )
+                try:
+                    out, err = proc.communicate(input=prompt, timeout=self.timeout)
+                except subprocess.TimeoutExpired as exc:
+                    _kill_process_group(proc)
+                    raise ModelRuntimeError(f"codex exec timed out after {self.timeout}s") from exc
                 if proc.returncode != 0:
-                    raise ModelRuntimeError((proc.stderr or proc.stdout or "codex exec failed").strip())
-                output = out_path.read_text(encoding="utf-8") if out_path.exists() else proc.stdout
+                    raise ModelRuntimeError((err or out or "codex exec failed").strip())
+                output = out_path.read_text(encoding="utf-8") if out_path.exists() else out
                 data = _parse_records(output)
-        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+        except (OSError, json.JSONDecodeError) as exc:
             raise ModelRuntimeError(str(exc)) from exc
         return [record for record in data if _valid_record(record, schema)]
 

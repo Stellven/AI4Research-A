@@ -240,6 +240,15 @@ class EvidenceCardBuildOperator(Operator):
         return {"spans_considered": considered, "evidence_built": len(rows), "spans_skipped": skipped}
 
 
+def _is_substantive_claim(text: str) -> bool:
+    """A claim must read as a statement, not a transcript shard ('its head.', 'mat.', 'both.',
+    'was', 'relying on a fixed tag.'). The reliable signal is length, not capitalization (real
+    transcript text often starts lowercase): require a sentence-sized span — at least 30 chars and
+    5 words. Keeps the claim ledger and the contradiction surface clean (B3)."""
+    t = (text or "").strip()
+    return len(t) >= 30 and len(t.split()) >= 5
+
+
 class ClaimLiteBuildOperator(Operator):
     NAME = "ClaimLiteBuildOperator"
     INPUT_SCHEMAS = ["evidence"]
@@ -247,7 +256,11 @@ class ClaimLiteBuildOperator(Operator):
 
     def run(self, ctx: RunContext, work: WorkStore, pipeline: list[Operator]) -> dict:
         claims, links, edges = [], [], []
+        skipped = 0
         for ev in work.read_rows("evidence"):
+            if not _is_substantive_claim(ev.get("summary")):   # don't build a claim from a fragment
+                skipped += 1
+                continue
             claim_id = ids.mint(ctx.run_id, "CLAIM", len(claims))
             claim_type = _EVIDENCE_TYPE_TO_CLAIM_TYPE.get(ev["evidence_type"], "technical_fact")
             claims.append({
@@ -269,7 +282,7 @@ class ClaimLiteBuildOperator(Operator):
         work.write_rows("claims", claims)
         work.write_rows("claim_evidence", links)
         work.write_rows("claim_edges", edges)
-        return {"claims": len(claims), "accepted": len(claims)}
+        return {"claims": len(claims), "accepted": len(claims), "skipped_fragments": skipped}
 
 
 def _numeric(value) -> float | int | None:
@@ -456,6 +469,45 @@ class EntityTagOperator(Operator):
         work.write_rows("entities", entities)
         work.write_rows("claim_entities", links)
         return {"entities": len(entities), "links": len(links)}
+
+
+class ClaimEntityBackfillOperator(Operator):
+    """Deterministic post-gate ontology backfill. EntityTagOperator (static vocab) and
+    OntologyDeriveOperator (LLM-derived concepts) tag claims that are ALREADY accepted at their
+    pre-gate slot — but LLM-synthesized comparison claims are created as `draft` and only promoted
+    to `accepted` later by the gate suite (EntailmentGate), AFTER those taggers run. So the
+    synthesized cross-source claims carry no claim_entities, and the contradiction detector's
+    contested-concept anchoring can never see exactly the claims it targets. This runs after the
+    gate suite and re-applies the existing entities' word-boundary match to every accepted claim not
+    yet linked. Deterministic + idempotent; inert without an ontology, and a no-op on the
+    deterministic path (no claims become accepted between tagging and the gate suite there), so the
+    no-runtime report stays byte-identical."""
+
+    NAME = "ClaimEntityBackfillOperator"
+    INPUT_SCHEMAS = ["claims", "entities", "claim_entities"]
+    OUTPUT_SCHEMAS = ["claim_entities"]
+
+    def run(self, ctx: RunContext, work: WorkStore, pipeline: list[Operator]) -> dict:
+        entities = work.read_rows("entities")
+        if not entities:
+            return {"backfilled": 0, "reason": "no ontology"}
+        existing = work.read_rows("claim_entities")
+        seen = {(l["claim_id"], l["entity_id"]) for l in existing}
+        ent_terms = [(e["entity_id"], [e["canonical_name"]] + list(e.get("synonyms") or [])) for e in entities]
+        new_links: list = []
+        for c in work.read_rows("claims"):
+            if c.get("status") not in ("accepted", "qualified"):
+                continue
+            text_lower = (c.get("claim_text") or "").lower()
+            for ent_id, terms in ent_terms:
+                if (c["claim_id"], ent_id) in seen:
+                    continue
+                if any(_term_pattern(term).search(text_lower) for term in terms):
+                    new_links.append({"claim_id": c["claim_id"], "entity_id": ent_id})
+                    seen.add((c["claim_id"], ent_id))
+        if new_links:
+            work.write_rows("claim_entities", existing + new_links)
+        return {"backfilled": len(new_links)}
 
 
 class CitationMapBuildOperator(Operator):

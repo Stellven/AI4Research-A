@@ -396,6 +396,26 @@ def gate_source_set_limitations(s, contract):
                    issues, {"missing_metadata": missing_meta, "failed_attempts": failed})
 
 
+def gate_source_class_coverage(s, contract):
+    """Mark the run *incomplete* when a supplied source class contributed ZERO evidence — e.g. all
+    GitHub repos failed to acquire while YouTube succeeded (which the total-coverage gate misses).
+    Warning, not a block: a partial answer is still useful, but the report must say it is partial (M4)."""
+    cls_of_container = {c["container_id"]: c.get("source_pack_type", "unknown") for c in s["source_containers"]}
+    item_cls = {it["selected_item_id"]: cls_of_container.get(it["container_id"], "unknown")
+                for it in s["selected_source_items"]}
+    # every supplied class (from the containers — so a class that fetched ZERO items is still seen),
+    supplied = set(cls_of_container.values())
+    # the classes that actually produced evidence (ignore evidence with a dangling item id)
+    with_evidence = {item_cls[e["selected_item_id"]] for e in s["evidence"] if e.get("selected_item_id") in item_cls}
+    failed = sorted(cls for cls in supplied if cls not in with_evidence)
+    metrics = {"classes": sorted(supplied), "failed_classes": failed}
+    if failed:
+        return _result("SourceClassCoverageGate", WARNING, WARN,
+                       ["source_containers", "acquisition_attempts", "evidence"],
+                       [f"source class '{c}' contributed no evidence — report is partial" for c in failed], metrics)
+    return _ok("SourceClassCoverageGate", WARN, ["source_containers", "evidence"], metrics)
+
+
 _STOPWORDS = {
     "about", "above", "after", "also", "from", "have", "into", "most", "noted", "that",
     "their", "there", "these", "they", "this", "what", "when", "where", "which", "with",
@@ -446,7 +466,7 @@ GATES = [
     gate_reference_integrity, gate_span_offsets, gate_claim_support, gate_critical_claim,
     gate_citation_resolution, gate_report_grounding, gate_synthesis_grounding, gate_figure_grounding,
     gate_entailment,
-    gate_source_coverage, gate_source_set_limitations,
+    gate_source_coverage, gate_source_set_limitations, gate_source_class_coverage,
     gate_question_coverage,
 ]
 

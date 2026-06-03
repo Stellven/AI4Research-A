@@ -54,7 +54,8 @@ DOMAIN_PACKS: dict[str, dict] = {
         "scoring_weights": {"github_stars_full_scale": 10000},
         "required_sections": _SECTION_HEADINGS,
         "required_gates": list(_BASE_GATES) + ["QuestionCoverageGate"],
-        "llm_operators": ["LLMSynthesisOperator"],
+        "llm_operators": ["OntologyDeriveOperator", "LLMSynthesisOperator", "ContradictionDetectOperator",
+                          "ClaimCriticOperator", "AnswerSynthesisOperator"],
         "question_template": [
             {"id": "Q0", "type": "root_question", "text": "<topic>"},
             {"id": "Q1", "type": "sub_question", "text": "Which repositories are most active?"},
