@@ -66,6 +66,7 @@ def run_fetch(
     channel_lister: ChannelLister | None = None,
     transcript_fetcher: TranscriptFetcher | None = None,
     github_client: GitHubClient | None = None,
+    perspectives: dict | None = None,
 ) -> dict:
     """Fetch channels/repos into a source pack at `out_dir`. Clients are injectable (tests pass
     fakes); defaults are the real network clients (lazy). Returns a summary dict. Raises
@@ -84,7 +85,9 @@ def run_fetch(
         from .clients import ApiGitHubClient
         github_client = ApiGitHubClient()
 
+    perspectives = perspectives or {}     # locator -> source stance (provenance hint, #12)
     containers: list[dict] = []
+    seen_video_ids: set = set()           # same video surfaced by two perspectives' channels: stage once
     summary = {"channels": 0, "videos": 0, "transcripts": 0, "video_gaps": 0,
                "repos": 0, "repo_gaps": 0, "errors": []}
 
@@ -96,11 +99,17 @@ def run_fetch(
         except Exception as exc:  # noqa: BLE001 - one bad channel must not abort the run
             summary["errors"].append(f"channel {channel_url}: {type(exc).__name__}: {exc}")
             containers.append({"container_id": f"C-YT-{ci}", "source_pack_type": "youtube_channel",
-                               "container_locator": channel_url, "label": channel_url, "items": []})
+                               "container_locator": channel_url, "label": channel_url, "items": [],
+                               "source_perspective": perspectives.get(channel_url, "basic")})
             continue
         summary["channels"] += 1
         items = []
         for vi, v in enumerate(videos):
+            vid = getattr(v, "video_id", None)
+            if vid and vid in seen_video_ids:
+                continue                       # already staged from another perspective's search
+            if vid:
+                seen_video_ids.add(vid)
             item_id = f"V-{ci}-{vi}"
             summary["videos"] += 1
             try:
@@ -131,7 +140,8 @@ def run_fetch(
                 summary["errors"].append(f"video {item_id}: {type(exc).__name__}: {exc}")
                 summary["video_gaps"] += 1
         containers.append({"container_id": f"C-YT-{ci}", "source_pack_type": "youtube_channel",
-                           "container_locator": channel_url, "label": channel_url, "items": items})
+                           "container_locator": channel_url, "label": channel_url, "items": items,
+                           "source_perspective": perspectives.get(channel_url, "basic")})
 
     for ri, repo_url in enumerate(repos or []):
         item_id = f"R-{ri}"
@@ -151,14 +161,16 @@ def run_fetch(
                                           "releases_in_window": getattr(meta, "releases_in_window", None),
                                           "last_release": getattr(meta, "last_release", None)}}
             containers.append({"container_id": f"C-GH-{ri}", "source_pack_type": "github_repo",
-                               "container_locator": repo_url, "label": getattr(meta, "name", repo_url), "items": [item]})
+                               "container_locator": repo_url, "label": getattr(meta, "name", repo_url),
+                               "items": [item], "source_perspective": perspectives.get(repo_url, "basic")})
         except FetchDependencyError:
             raise
         except Exception as exc:  # noqa: BLE001 - a bad repo (or injected client) must not abort the run
             summary["errors"].append(f"repo {repo_url}: {type(exc).__name__}: {exc}")
             summary["repo_gaps"] += 1
             containers.append({"container_id": f"C-GH-{ri}", "source_pack_type": "github_repo",
-                               "container_locator": repo_url, "label": repo_url, "items": []})
+                               "container_locator": repo_url, "label": repo_url, "items": [],
+                               "source_perspective": perspectives.get(repo_url, "basic")})
 
     (out / "source_containers.jsonl").write_text(
         "\n".join(json.dumps(c, ensure_ascii=False) for c in containers), encoding="utf-8")

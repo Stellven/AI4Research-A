@@ -299,31 +299,64 @@ class QueryPlanningTest(unittest.TestCase):
         # all-filler degrades to the original rather than empty
         self.assertEqual(normalize_query("the latest news"), "the latest news")
 
-    def test_plan_queries_heuristic_without_runtime(self):
+    def test_plan_queries_heuristic_returns_perspective_list(self):
         from ai4research.fetch.query import plan_queries
-        plan = plan_queries("latest development on GEPA")
-        self.assertEqual(plan["source"], "heuristic")
-        self.assertEqual(plan["github"], "GEPA")
-        self.assertEqual(plan["youtube"], "GEPA")
+        plan = plan_queries("latest development on GEPA")        # not a comparison topic
+        self.assertIsInstance(plan, list)
+        self.assertEqual(plan[0]["source"], "heuristic")
+        self.assertEqual(plan[0]["perspective"], "basic")
+        self.assertEqual(plan[0]["github"], "GEPA")              # element 0 == today's exact pair
+        skeptic = next(p for p in plan if p["perspective"] == "skeptic")   # floor guarantees a skeptic
+        self.assertIn("limitations", skeptic["github"])
 
-    def test_plan_queries_uses_llm_records(self):
+    def test_plan_queries_comparison_flips_operands_for_skeptic(self):
+        from ai4research.fetch.query import plan_queries
+        plan = plan_queries("Are state-space models meaningfully better than transformers")
+        gh = next(p for p in plan if p["perspective"] == "skeptic")["github"]
+        self.assertIn("transformers", gh)
+        self.assertIn("state-space", gh)
+        self.assertLess(gh.index("transformers"), gh.index("state-space"))   # operands flipped
+        self.assertIn("limitations", gh)
+
+    def test_plan_queries_uses_llm_perspectives(self):
         from ai4research.fetch.query import plan_queries
         from ai4research.model_runtime import StubRuntime
-        rt = StubRuntime(records=[{"github_query": "gepa-ai gepa",
-                                   "youtube_query": "GEPA prompt optimization DSPy"}])
+        rt = StubRuntime(records=[{"perspectives": [
+            {"perspective": "proponent", "github_query": "gepa-ai gepa", "youtube_query": "GEPA DSPy"},
+            {"perspective": "skeptic", "github_query": "gepa limitations", "youtube_query": "GEPA criticism"},
+        ]}])
         plan = plan_queries("latest development on GEPA", rt)
-        self.assertEqual(plan["source"], "stub")
-        self.assertEqual(plan["github"], "gepa-ai gepa")
-        self.assertEqual(plan["youtube"], "GEPA prompt optimization DSPy")
+        self.assertEqual(plan[0]["source"], "stub")
+        self.assertEqual(plan[0]["github"], "gepa-ai gepa")
+        self.assertEqual(len(plan), 2)
 
-    def test_plan_queries_falls_back_when_runtime_fails_or_empty(self):
+    def test_plan_queries_falls_back_to_perspective_list(self):
         from ai4research.fetch.query import plan_queries
         from ai4research.model_runtime import StubRuntime
         failed = plan_queries("latest development on GEPA", StubRuntime(error=RuntimeError("boom")))
-        self.assertEqual(failed["source"], "heuristic")
-        self.assertEqual(failed["github"], "GEPA")
-        empty = plan_queries("latest development on GEPA", StubRuntime(records=[]))
-        self.assertEqual(empty["source"], "heuristic")
+        self.assertEqual(failed[0]["source"], "heuristic")
+        self.assertEqual(failed[0]["github"], "GEPA")
+        self.assertEqual(plan_queries("x", StubRuntime(records=[]))[0]["source"], "heuristic")
+
+    def test_allocate_reserves_minority_seats(self):
+        from ai4research.fetch.cli import _allocate
+        alloc = _allocate([{"perspective": "basic"}, {"perspective": "skeptic"}], 5, 5)
+        seats = {p["perspective"]: (r, v) for p, r, v in alloc}
+        self.assertGreaterEqual(seats["basic"][0], 1)                 # floor: >=1 repo each
+        self.assertGreaterEqual(seats["skeptic"][0], seats["basic"][0])  # remainder favors minority
+        self.assertEqual(sum(r for _, r, _ in alloc), 5)             # bounded to max_repos
+
+    def test_run_fetch_stamps_source_perspective_and_dedups_videos(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lister = FakeLister([VideoMeta("dup", "https://youtu.be/dup", "T", "2026-05-01")])
+            transcripts = FakeTranscripts({"dup": [{"start": 0, "text": SEG1}]})
+            run_fetch(tmp, channels=["c-skeptic", "c-other"], repos=[], channel_lister=lister,
+                      transcript_fetcher=transcripts, github_client=FakeGitHub({}),
+                      perspectives={"c-skeptic": "skeptic"})
+            pack = [json.loads(l) for l in (Path(tmp) / "source_containers.jsonl").read_text().splitlines()]
+            self.assertEqual(pack[0]["source_perspective"], "skeptic")   # tagged from provenance
+            self.assertEqual(pack[1]["source_perspective"], "basic")     # untagged defaults to basic
+            self.assertEqual(sum(len(c["items"]) for c in pack), 1)      # 'dup' staged once across channels
 
     def test_github_search_relaxes_to_longest_token_on_empty(self):
         from ai4research.fetch.clients import ApiGitHubClient, _search_relaxations
